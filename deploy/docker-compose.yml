@@ -1,0 +1,96 @@
+version: "3.8"
+
+services:
+  freetour-db:
+    image: postgres:16-alpine
+    container_name: freetour-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: freetour
+      POSTGRES_PASSWORD: ${PG_PASS}
+      POSTGRES_DB: freetouria
+    volumes:
+      - freetour-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U freetour -d freetouria"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - freetour-net
+
+  freetour-api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: freetour-api
+    restart: unless-stopped
+    depends_on:
+      freetour-db:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      DATABASE_URL: postgresql://freetour:${PG_PASS}@freetour-db:5432/freetouria?schema=public
+      JWT_SECRET: ${JWT_SECRET}
+      AI_PROVIDER: anthropic
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      ANTHROPIC_MODEL: claude-sonnet-4-6
+      ANTHROPIC_MAX_TOKENS: "1024"
+      TTS_PROVIDER: elevenlabs
+      ELEVENLABS_API_KEY: ${ELEVENLABS_API_KEY}
+      ELEVENLABS_MODEL: eleven_multilingual_v2
+      ELEVENLABS_VOICE_ID: h2cd3gvcqTp3m65Dysk7
+      ELEVENLABS_AGENT_ID: agent_6801kp1hvhpnf2aawt8a01jmw4b5
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      STORAGE_PROVIDER: local
+      AUDIO_STORAGE_PATH: /app/storage/audio
+      ALLOWED_ORIGINS: "https://api.freetour.hawkins.es,https://api-freetour.217-160-39-79.sslip.io,exp://expo.dev,*"
+    volumes:
+      - freetour-audio:/app/storage/audio
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - freetour-net
+      - coolify
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=coolify"
+      - "traefik.http.services.freetour-api.loadbalancer.server.port=3000"
+      # Custom domain (waits for DNS to resolve)
+      - "traefik.http.routers.freetour-api.rule=Host(`api.freetour.hawkins.es`)"
+      - "traefik.http.routers.freetour-api.entrypoints=https"
+      - "traefik.http.routers.freetour-api.tls=true"
+      - "traefik.http.routers.freetour-api.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.freetour-api.service=freetour-api"
+      - "traefik.http.routers.freetour-api-http.rule=Host(`api.freetour.hawkins.es`)"
+      - "traefik.http.routers.freetour-api-http.entrypoints=http"
+      - "traefik.http.routers.freetour-api-http.middlewares=freetour-https-redirect"
+      - "traefik.http.routers.freetour-api-http.service=freetour-api"
+      # sslip.io fallback (works without user DNS configuration)
+      - "traefik.http.routers.freetour-sslip.rule=Host(`api-freetour.217-160-39-79.sslip.io`)"
+      - "traefik.http.routers.freetour-sslip.entrypoints=https"
+      - "traefik.http.routers.freetour-sslip.tls=true"
+      - "traefik.http.routers.freetour-sslip.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.freetour-sslip.service=freetour-api"
+      - "traefik.http.routers.freetour-sslip-http.rule=Host(`api-freetour.217-160-39-79.sslip.io`)"
+      - "traefik.http.routers.freetour-sslip-http.entrypoints=http"
+      - "traefik.http.routers.freetour-sslip-http.middlewares=freetour-https-redirect"
+      - "traefik.http.routers.freetour-sslip-http.service=freetour-api"
+      # HTTPS redirect middleware
+      - "traefik.http.middlewares.freetour-https-redirect.redirectscheme.scheme=https"
+      - "traefik.http.middlewares.freetour-https-redirect.redirectscheme.permanent=true"
+
+volumes:
+  freetour-db-data:
+  freetour-audio:
+
+networks:
+  freetour-net:
+    driver: bridge
+  coolify:
+    external: true

@@ -22,14 +22,14 @@
         "buildConfiguration": "Release"
       },
       "env": {
-        "EXPO_PUBLIC_API_URL": "https://api.freetour.hawkins.es"
+        "EXPO_PUBLIC_API_URL": "https://api-freetour.217-160-39-79.sslip.io"
       }
     },
     "production": {
       "autoIncrement": true,
       "channel": "production",
       "env": {
-        "EXPO_PUBLIC_API_URL": "https://api.freetour.hawkins.es"
+        "EXPO_PUBLIC_API_URL": "https://api-freetour.217-160-39-79.sslip.io"
       }
     }
   },
