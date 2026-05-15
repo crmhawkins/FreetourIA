@@ -1,0 +1,50 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Build outputs
+dist/
+build/
+.expo/
+*.tsbuildinfo
+
+# Environment files (NEVER commit these)
+.env
+.env.local
+.env.production
+.env.*.local
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# Runtime
+pids/
+*.pid
+*.seed
+*.pid.lock
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/settings.json
+.idea/
+
+# Uploads and generated content
+apps/backend/uploads/
+apps/backend/storage/
+
+# App signing credentials (NEVER commit)
+google-service-account.json
+apps/mobile/google-services.json
+apps/mobile/GoogleService-Info.plist
+*.p8
+*.p12
+*.mobileprovision
+
+# Coverage
+coverage/

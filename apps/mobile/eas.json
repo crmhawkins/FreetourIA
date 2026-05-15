@@ -1,0 +1,58 @@
+{
+  "cli": {
+    "version": ">= 12.0.0",
+    "promptToConfigurePushNotifications": false
+  },
+  "build": {
+    "development": {
+      "developmentClient": true,
+      "distribution": "internal",
+      "ios": {
+        "simulator": true
+      },
+      "env": {
+        "EXPO_PUBLIC_API_URL": "http://localhost:3000"
+      }
+    },
+    "preview": {
+      "distribution": "store",
+      "autoIncrement": true,
+      "channel": "preview",
+      "ios": {
+        "buildConfiguration": "Release"
+      },
+      "env": {
+        "EXPO_PUBLIC_API_URL": "https://api.freetour.hawkins.es"
+      }
+    },
+    "production": {
+      "autoIncrement": true,
+      "channel": "production",
+      "env": {
+        "EXPO_PUBLIC_API_URL": "https://api.freetour.hawkins.es"
+      }
+    }
+  },
+  "submit": {
+    "preview": {
+      "ios": {
+        "_comment": "Rellenar antes de ejecutar `eas submit --profile preview --platform ios`. appleId = email de la cuenta Apple Developer. ascAppId = ID numerico de la app en App Store Connect (lo obtienes tras crear la app en https://appstoreconnect.apple.com). appleTeamId = Team ID de 10 caracteres en https://developer.apple.com/account#MembershipDetailsCard.",
+        "appleId": "your@apple.id",
+        "ascAppId": "YOUR_APP_STORE_CONNECT_APP_ID",
+        "appleTeamId": "YOUR_APPLE_TEAM_ID"
+      }
+    },
+    "production": {
+      "ios": {
+        "_comment": "Rellenar antes de ejecutar `eas submit --profile production --platform ios`. appleId = email de la cuenta Apple Developer. ascAppId = ID numerico de la app en App Store Connect. appleTeamId = Team ID de 10 caracteres de la membership.",
+        "appleId": "your@apple.id",
+        "ascAppId": "YOUR_APP_STORE_CONNECT_APP_ID",
+        "appleTeamId": "YOUR_APPLE_TEAM_ID"
+      },
+      "android": {
+        "serviceAccountKeyPath": "./google-service-account.json",
+        "track": "internal"
+      }
+    }
+  }
+}

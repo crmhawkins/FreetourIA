@@ -1,0 +1,22 @@
+diff --git a/node_modules/expo-audio/build/ExpoAudio.js b/node_modules/expo-audio/build/ExpoAudio.js
+index 0a9e4a4..62a6df9 100644
+--- a/node_modules/expo-audio/build/ExpoAudio.js
++++ b/node_modules/expo-audio/build/ExpoAudio.js
+@@ -23,7 +23,7 @@ if (!Platform.isTV || Platform.OS !== 'ios') {
+ // @docsMissing
+ export function useAudioPlayer(source = null, updateInterval = 500) {
+     const parsedSource = resolveSource(source);
+-    return useReleasingSharedObject(() => new AudioModule.AudioPlayer(parsedSource, updateInterval), [JSON.stringify(parsedSource)]);
++    return useReleasingSharedObject(() => new AudioModule.AudioPlayer(parsedSource, updateInterval, false), [JSON.stringify(parsedSource)]);
+ }
+ // @docsMissing
+ export function useAudioPlayerStatus(player) {
+@@ -76,7 +76,7 @@ export function useAudioRecorderState(recorder, interval = 500) {
+  */
+ export function createAudioPlayer(source = null, updateInterval = 500) {
+     const parsedSource = resolveSource(source);
+-    return new AudioModule.AudioPlayer(parsedSource, updateInterval);
++    return new AudioModule.AudioPlayer(parsedSource, updateInterval, false);
+ }
+ // @docsMissing
+ export async function setIsAudioActiveAsync(active) {

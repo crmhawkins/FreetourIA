@@ -1,0 +1,48 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: freetour_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: freetour
+      POSTGRES_PASSWORD: freetour_pass
+      POSTGRES_DB: freetour_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U freetour -d freetour_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Backend API (uncomment for full stack local dev)
+  # backend:
+  #   build:
+  #     context: ./apps/backend
+  #     dockerfile: Dockerfile
+  #   container_name: freetour_backend
+  #   restart: unless-stopped
+  #   ports:
+  #     - "3000:3000"
+  #   environment:
+  #     NODE_ENV: production
+  #     DATABASE_URL: postgresql://freetour:freetour_pass@postgres:5432/freetour_db
+  #     JWT_SECRET: ${JWT_SECRET}
+  #     OPENAI_API_KEY: ${OPENAI_API_KEY}
+  #     ALLOWED_ORIGINS: ${ALLOWED_ORIGINS}
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #   volumes:
+  #     - audio_uploads:/app/uploads/audio
+
+volumes:
+  postgres_data:
+    driver: local
+  # audio_uploads:
+  #   driver: local

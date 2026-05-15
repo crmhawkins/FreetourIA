@@ -1,0 +1,81 @@
+{
+  "expo": {
+    "name": "FreeTour IA",
+    "slug": "freetour-ia",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "automatic",
+    "newArchEnabled": true,
+    "scheme": "freetour",
+    "splash": {
+      "image": "./assets/splash-icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#007AFF"
+    },
+    "assetBundlePatterns": [
+      "**/*"
+    ],
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.freetour.ia",
+      "buildNumber": "1",
+      "infoPlist": {
+        "NSLocationWhenInUseUsageDescription": "FreeTour IA necesita tu ubicación para detectar en qué ciudad estás y guiarte por la ruta turística.",
+        "NSLocationAlwaysAndWhenInUseUsageDescription": "FreeTour IA necesita tu ubicación para guiarte durante el tour.",
+        "NSMicrophoneUsageDescription": "FreeTour IA usa el micrófono para la narración de audio del tour.",
+        "NSSpeechRecognitionUsageDescription": "FreeTour IA puede usar el reconocimiento de voz para responder tus preguntas.",
+        "NSCameraUsageDescription": "FreeTour IA puede usar la cámara para escanear códigos QR de grupos.",
+        "UIBackgroundModes": [
+          "location",
+          "audio"
+        ]
+      },
+      "privacyManifests": {
+        "NSPrivacyAccessedAPITypes": [
+          {
+            "NSPrivacyAccessedAPIType": "NSPrivacyAccessedAPICategoryUserDefaults",
+            "NSPrivacyAccessedAPITypeReasons": ["CA92.1"]
+          }
+        ]
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#007AFF"
+      },
+      "edgeToEdgeEnabled": true,
+      "predictiveBackGestureEnabled": false,
+      "package": "com.freetour.ia",
+      "versionCode": 1,
+      "permissions": [
+        "ACCESS_FINE_LOCATION",
+        "ACCESS_COARSE_LOCATION",
+        "RECORD_AUDIO",
+        "INTERNET",
+        "ACCESS_NETWORK_STATE"
+      ]
+    },
+    "web": {
+      "favicon": "./assets/favicon.png",
+      "bundler": "metro"
+    },
+    "plugins": [
+      [
+        "expo-location",
+        {
+          "locationAlwaysAndWhenInUsePermission": "Permitir que FreeTour IA acceda a tu ubicación para guiarte por el tour.",
+          "locationWhenInUsePermission": "Permitir que FreeTour IA acceda a tu ubicación para detectar tu ciudad y guiarte.",
+          "isAndroidBackgroundLocationEnabled": true,
+          "isAndroidForegroundServiceEnabled": true
+        }
+      ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "your-eas-project-id"
+      }
+    }
+  }
+}

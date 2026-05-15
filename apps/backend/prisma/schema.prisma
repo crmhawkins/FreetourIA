@@ -1,0 +1,158 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// --------------------------------------
+// USERS & AUTH
+// --------------------------------------
+
+model User {
+  id        String   @id @default(uuid())
+  email     String   @unique
+  password  String   // Hashed with bcrypt
+  name      String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  hostedSessions GroupSession[] @relation("HostSessions")
+  ratings        Rating[]
+  tourHistory    TourHistory[]
+
+  @@index([email])
+}
+
+// --------------------------------------
+// ROUTES & CONTENT
+// --------------------------------------
+
+model Route {
+  id                String   @id @default(uuid())
+  name              String
+  description       String
+  city              String
+  difficulty        String   // "EASY", "MEDIUM", "HARD"
+  estimatedDuration Int      // in minutes
+  distance          Float    // in km
+  tags              String[] // ["kids", "history", "food"]
+  imageUrl          String?  // Cover image
+  isPublished       Boolean  @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  points        PointOfInterest[]
+  groupSessions GroupSession[]
+  ratings       Rating[]
+  tourHistory   TourHistory[]
+
+  @@index([city])
+  @@index([city, difficulty])
+  @@index([isPublished])
+  @@index([createdAt])
+}
+
+model PointOfInterest {
+  id          String   @id @default(uuid())
+  routeId     String
+  orderIndex  Int
+  name        String
+  description String?
+  latitude    Float
+  longitude   Float
+
+  // Stable ID for caching (e.g. "VENICE_SAN_MARCO")
+  stableId    String?
+
+  route         Route          @relation(fields: [routeId], references: [id], onDelete: Cascade)
+  contentCaches ContentCache[]
+
+  @@index([routeId])
+  @@index([stableId])
+}
+
+model ContentCache {
+  id             String   @id @default(uuid())
+  pointId        String
+  language       String   // "es", "en", "fr"
+  experienceType String   // "CLASSIC", "KIDS", "HISTORY"
+
+  textContent    String   @db.Text
+  audioUrl       String?
+
+  createdAt      DateTime @default(now())
+
+  point          PointOfInterest @relation(fields: [pointId], references: [id], onDelete: Cascade)
+
+  @@unique([pointId, language, experienceType])
+  @@index([pointId])
+}
+
+// --------------------------------------
+// GROUP SESSIONS
+// --------------------------------------
+
+model GroupSession {
+  id             String   @id @default(uuid())
+  code           String   @unique // Short code for joining
+  hostUserId     String
+  routeId        String
+  currentPointId String?
+  status         String   // "WAITING", "ACTIVE", "FINISHED"
+
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  host           User     @relation("HostSessions", fields: [hostUserId], references: [id])
+  route          Route    @relation(fields: [routeId], references: [id])
+
+  @@index([code])
+  @@index([hostUserId])
+  @@index([status])
+}
+
+// --------------------------------------
+// RATINGS
+// --------------------------------------
+
+model Rating {
+  id        String   @id @default(uuid())
+  routeId   String
+  userId    String?  // Optional if anonymous
+  rating    Int      // 1-5
+  comment   String?
+  createdAt DateTime @default(now())
+
+  route     Route    @relation(fields: [routeId], references: [id], onDelete: Cascade)
+  user      User?    @relation(fields: [userId], references: [id])
+
+  @@index([routeId])
+  @@index([userId])
+}
+
+// --------------------------------------
+// TOUR HISTORY
+// --------------------------------------
+
+model TourHistory {
+  id          String   @id @default(uuid())
+  userId      String
+  routeId     String
+  pointsCount Int
+  completedAt DateTime @default(now())
+
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  route       Route    @relation(fields: [routeId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([userId, completedAt])
+}
