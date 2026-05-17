@@ -15,7 +15,7 @@ concurrency:
 jobs:
   build:
     name: Build & Submit to TestFlight
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 60
     defaults:
       run:
