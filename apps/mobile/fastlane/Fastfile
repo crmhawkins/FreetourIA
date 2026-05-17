@@ -14,21 +14,7 @@ platform :ios do
     bundle_id = ENV["APP_BUNDLE_ID"] || "com.freetour.ia"
     team_id   = ENV["APPLE_TEAM_ID"]
 
-    # Ensure the app exists in App Store Connect (create on first run).
-    # produce will return the existing app if it already exists.
-    begin
-      produce(
-        app_identifier: bundle_id,
-        app_name: "FreeTour IA",
-        language: "es-ES",
-        app_version: "1.0",
-        sku: "FREETOURIA001",
-        team_id: team_id,
-        api_key: api_key,
-      )
-    rescue => e
-      UI.message("produce raised — likely app already exists: #{e.message}")
-    end
+    # App creation handled externally via REST API before the workflow runs.
 
     # Get/Create distribution cert via API key (no 2FA needed)
     cert(
