@@ -1,0 +1,103 @@
+name: iOS ÔåÆ TestFlight
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'apps/mobile/**'
+      - '.github/workflows/ios-testflight.yml'
+
+concurrency:
+  group: ios-testflight
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build & Submit to TestFlight
+    runs-on: macos-14
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: apps/mobile
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: apps/mobile/package-lock.json
+
+      - name: Setup Ruby 3.2
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.2'
+
+      - name: Install Node deps (root + mobile)
+        working-directory: .
+        run: |
+          npm install --workspaces=false --no-audit --no-fund || true
+          cd apps/mobile
+          npm install --no-audit --no-fund
+
+      - name: Install Fastlane
+        run: gem install fastlane -NV
+
+      - name: Decode App Store Connect API Key
+        env:
+          ASC_API_KEY_P8_B64: ${{ secrets.ASC_API_KEY_P8_B64 }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+        run: |
+          mkdir -p $HOME/private_keys
+          echo "$ASC_API_KEY_P8_B64" | base64 --decode > $HOME/private_keys/AuthKey_${ASC_KEY_ID}.p8
+          ls -la $HOME/private_keys/
+
+      - name: Expo Prebuild (generate iOS project)
+        env:
+          EXPO_NO_TELEMETRY: '1'
+        run: npx expo prebuild --platform ios --clean --no-install
+
+      - name: Install CocoaPods
+        working-directory: apps/mobile/ios
+        run: |
+          pod install --repo-update
+
+      - name: Build & Upload to TestFlight
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APP_BUNDLE_ID: com.freetour.ia
+          ASC_API_KEY_PATH: ${{ format('{0}/private_keys/AuthKey_{1}.p8', github.workspace, secrets.ASC_KEY_ID) }}
+        working-directory: apps/mobile
+        run: |
+          # Resolve key path (HOME-based)
+          export ASC_API_KEY_PATH="$HOME/private_keys/AuthKey_${ASC_KEY_ID}.p8"
+          echo "Key path: $ASC_API_KEY_PATH"
+          ls -la "$ASC_API_KEY_PATH"
+          # Run fastlane
+          bundle exec fastlane ios beta || fastlane ios beta
+
+      - name: Upload .ipa as artifact (on success)
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: FreeTourIA-ipa
+          path: apps/mobile/ios/build/*.ipa
+          retention-days: 14
+
+      - name: Upload logs (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            apps/mobile/ios/build/**/*.log
+            ~/Library/Logs/gym/*
+            apps/mobile/fastlane/report.xml
+          retention-days: 7
+          if-no-files-found: ignore
