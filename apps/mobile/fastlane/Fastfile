@@ -1,0 +1,88 @@
+default_platform(:ios)
+
+platform :ios do
+  desc "Build the iOS app and submit it to TestFlight"
+  lane :beta do
+    # Authenticate with App Store Connect API (no Apple ID password / 2FA)
+    api_key = app_store_connect_api_key(
+      key_id: ENV["ASC_KEY_ID"],
+      issuer_id: ENV["ASC_ISSUER_ID"],
+      key_filepath: ENV["ASC_API_KEY_PATH"],
+      in_house: false,
+    )
+
+    bundle_id = ENV["APP_BUNDLE_ID"] || "com.freetour.ia"
+    team_id   = ENV["APPLE_TEAM_ID"]
+
+    # Ensure the app exists in App Store Connect (create on first run).
+    # produce will return the existing app if it already exists.
+    begin
+      produce(
+        app_identifier: bundle_id,
+        app_name: "FreeTour IA",
+        language: "es-ES",
+        app_version: "1.0",
+        sku: "FREETOURIA001",
+        team_id: team_id,
+        api_key: api_key,
+      )
+    rescue => e
+      UI.message("produce raised — likely app already exists: #{e.message}")
+    end
+
+    # Get/Create distribution cert via API key (no 2FA needed)
+    cert(
+      api_key: api_key,
+      development: false,
+    )
+
+    # Get/Create app-store provisioning profile
+    sigh(
+      api_key: api_key,
+      app_identifier: bundle_id,
+      force: true,
+      adhoc: false,
+      development: false,
+      readonly: false,
+    )
+
+    # Auto-increment build number based on TestFlight latest
+    increment_build_number_in_xcodeproj(
+      xcodeproj: "ios/FreeTourIA.xcodeproj",
+      build_number: latest_testflight_build_number(
+        api_key: api_key,
+        app_identifier: bundle_id,
+        initial_build_number: 1,
+      ).to_i + 1,
+    )
+
+    # Build the .ipa using Xcode
+    gym(
+      workspace: "ios/FreeTourIA.xcworkspace",
+      scheme: "FreeTourIA",
+      configuration: "Release",
+      export_method: "app-store",
+      clean: true,
+      output_directory: "ios/build",
+      output_name: "FreeTourIA.ipa",
+      export_options: {
+        provisioningProfiles: {
+          bundle_id => "match AppStore #{bundle_id}",
+        },
+      },
+      xcargs: "-allowProvisioningUpdates",
+    )
+
+    # Upload to TestFlight (don't wait for processing)
+    pilot(
+      api_key: api_key,
+      ipa: "ios/build/FreeTourIA.ipa",
+      skip_waiting_for_build_processing: true,
+      skip_submission: true,
+      apple_id: nil,
+      app_identifier: bundle_id,
+    )
+
+    UI.success("✅ FreeTour IA build uploaded to TestFlight. Processing on Apple's side: ~5-15 min.")
+  end
+end
