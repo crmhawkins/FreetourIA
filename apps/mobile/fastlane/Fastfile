@@ -14,12 +14,26 @@ platform :ios do
     bundle_id = ENV["APP_BUNDLE_ID"] || "com.freetour.ia"
     team_id   = ENV["APPLE_TEAM_ID"]
 
+    # Create a dedicated keychain with known password so codesign can run unattended
+    keychain_name = "freetour_keychain"
+    keychain_pwd  = "freetourpw"
+    create_keychain(
+      name: keychain_name,
+      password: keychain_pwd,
+      default_keychain: true,
+      unlock: true,
+      timeout: 3600,
+      lock_when_sleeps: false,
+    )
+
     # App creation handled externally via REST API before the workflow runs.
 
     # Get/Create distribution cert via API key (no 2FA needed)
     cert(
       api_key: api_key,
       development: false,
+      keychain_path: "#{ENV['HOME']}/Library/Keychains/#{keychain_name}-db",
+      keychain_password: keychain_pwd,
     )
 
     # Get/Create app-store provisioning profile
