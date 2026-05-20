@@ -54,9 +54,15 @@ jobs:
           echo "$ASC_API_KEY_P8_B64" | base64 --decode > $HOME/private_keys/AuthKey_${ASC_KEY_ID}.p8
           ls -la $HOME/private_keys/
 
+      - name: Create .env with backend URL
+        run: |
+          echo "EXPO_PUBLIC_API_URL=https://api-freetour.217-160-39-79.sslip.io" > .env
+          cat .env
+
       - name: Expo Prebuild (generate iOS project)
         env:
           EXPO_NO_TELEMETRY: '1'
+          EXPO_PUBLIC_API_URL: https://api-freetour.217-160-39-79.sslip.io
         run: npx expo prebuild --platform ios --clean --no-install
 
       - name: Install CocoaPods
@@ -71,6 +77,7 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APP_BUNDLE_ID: com.freetour.ia
           ASC_API_KEY_PATH: ${{ format('{0}/private_keys/AuthKey_{1}.p8', github.workspace, secrets.ASC_KEY_ID) }}
+          EXPO_PUBLIC_API_URL: https://api-freetour.217-160-39-79.sslip.io
         working-directory: apps/mobile
         run: |
           # Resolve key path (HOME-based)
