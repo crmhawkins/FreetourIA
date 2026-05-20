@@ -39,10 +39,12 @@ export default class ErrorBoundary extends Component<Props, State> {
                     <Text style={styles.subtitle}>
                         Ha ocurrido un error inesperado. Por favor, intenta de nuevo.
                     </Text>
-                    {__DEV__ && this.state.error && (
+                    {this.state.error && (
                         <View style={styles.debugBox}>
                             <Text style={styles.debugText}>
                                 {this.state.error.toString()}
+                                {'\n\n'}
+                                {this.state.error.stack?.split('\n').slice(0, 8).join('\n')}
                             </Text>
                         </View>
                     )}
