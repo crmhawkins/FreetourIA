@@ -319,6 +319,12 @@ export default function ExploreScreen({ navigation }: any) {
     // una nueva narración mientras habla, o el agente ElevenLabs interrumpe la
     // respuesta en curso y el audio se corta a media frase.
     const agentBusyRef = useRef<boolean>(false);
+    // Última vez que hubo actividad REAL del agente (audio llegando o player
+    // sonando). Si el agente lleva "ocupado" mucho tiempo SIN actividad, es que
+    // el estado se colgó (p.ej. el saludo inicial no emitió didJustFinish) y un
+    // watchdog lo rescata — si no, agentBusyRef quedaría true para siempre y el
+    // dwell no dispararía jamás.
+    const lastAgentActivityRef = useRef<number>(0);
     // Grabación: ref (no state) para evitar carreras onPressIn/onPressOut.
     const isRecordingRef = useRef<boolean>(false);
     // Promesa del arranque de grabación en curso (para await-earla al soltar).
@@ -436,8 +442,16 @@ export default function ExploreScreen({ navigation }: any) {
 
     // ── Track playing state ───────────────────────────────────────────────
     useEffect(() => {
-        if (playerStatus.playing) setAgentState('speaking');
+        if (playerStatus.playing) {
+            setAgentState('speaking');
+            lastAgentActivityRef.current = Date.now(); // actividad real → watchdog
+        }
     }, [playerStatus.playing]);
+
+    // ── Progreso del reproductor = actividad (para el watchdog) ────────────
+    useEffect(() => {
+        if (playerStatus.playing) lastAgentActivityRef.current = Date.now();
+    }, [playerStatus.currentTime]);
 
     // ── Seed location from global store — SOLO la primera vez ─────────────
     // El GPS grueso global de App.tsx (Balanced, 30s/50m) sigue vivo dentro de
@@ -478,9 +492,28 @@ export default function ExploreScreen({ navigation }: any) {
         connectToAgent();
         startFineTracking();
 
+        // ── Watchdog universal del estado del agente ────────────────────────
+        // Si el agente lleva >13s "ocupado" (thinking/speaking) SIN actividad real
+        // (ni audio llegando ni player sonando), el estado se colgó — típicamente
+        // el saludo inicial que no emitió didJustFinish, dejando agentBusyRef=true
+        // para siempre y el dwell muerto. Lo rescatamos a un estado limpio.
+        const agentWatchdog = setInterval(() => {
+            if (!agentBusyRef.current || isRecordingRef.current) return;
+            if (Date.now() - lastAgentActivityRef.current <= 13000) return;
+            // Colgado: limpiar cola/estado y volver a escuchar.
+            if (wsAudioFlushTimer.current) { clearTimeout(wsAudioFlushTimer.current); wsAudioFlushTimer.current = null; }
+            for (const uri of audioQueueRef.current) FileSystem.deleteAsync(uri, { idempotent: true }).catch(() => {});
+            audioQueueRef.current = [];
+            wsAudioChunks.current = [];
+            isPlayingRef.current = false;
+            try { player.pause(); } catch (_) {}
+            setAgentState(wsRef.current?.readyState === WebSocket.OPEN ? 'listening' : 'idle');
+        }, 3000);
+
         return () => {
             unmountedRef.current = true;
             intentionalCloseRef.current = true;
+            clearInterval(agentWatchdog);
             locationSub.current?.remove();
             headingSub.current?.remove();
             const ws = wsRef.current;
@@ -501,13 +534,18 @@ export default function ExploreScreen({ navigation }: any) {
         if (unmountedRef.current) return;
         if (status !== 'granted') { setPermissionError(true); return; }
 
-        // ── Seed inicial de heading (fix inicial crudo) ──────────────────────
-        // Sin esto, smoothedHeadingRef arranca en el sentinel null y el primer
-        // evento real "tira" desde 0. Con un fix inicial, la brújula parte del
-        // valor real de inmediato.
-        try {
-            const h = await Location.getHeadingAsync();
-            if (unmountedRef.current) return;
+        // ── Seed inicial de heading EN PARALELO (NO bloquea el montaje) ──────
+        // getHeadingAsync() puede colgar o tardar varios segundos si la brújula
+        // está sin calibrar. Si lo esperáramos con await ANTES de montar los
+        // watchers, el GPS y la brújula NUNCA arrancarían (bug: mapa sin marcador
+        // y dwell que no dispara). Lo lanzamos como fire-and-forget con timeout de
+        // 1.5s; si no llega a tiempo, el sentinel null hace que la primera muestra
+        // del watch siembre el heading. Los watchers de abajo se montan siempre.
+        Promise.race([
+            Location.getHeadingAsync(),
+            new Promise<null>((res) => setTimeout(() => res(null), 1500)),
+        ]).then((h) => {
+            if (unmountedRef.current || !h || smoothedHeadingRef.current !== null) return;
             const seed = h.trueHeading >= 0 ? h.trueHeading : (h.magHeading >= 0 ? h.magHeading : null);
             if (seed !== null) {
                 const rounded = Math.round(((seed % 360) + 360) % 360);
@@ -518,7 +556,7 @@ export default function ExploreScreen({ navigation }: any) {
                 mapHeadingRef.current = rounded;
                 lastReportedHeadingRef.current = rounded;
             }
-        } catch (_) { /* sin fix inicial: la primera muestra del watch lo siembra */ }
+        }).catch(() => {});
 
         locationSub.current = await Location.watchPositionAsync(
             { accuracy: Location.Accuracy.High, distanceInterval: 8, timeInterval: 4000 },
@@ -575,7 +613,11 @@ export default function ExploreScreen({ navigation }: any) {
             // Si accuracy viene null/undefined/negativo NO descartamos: mejor un
             // heading ruidoso que uno congelado.
             const acc: number | null = (typeof hd.accuracy === 'number') ? hd.accuracy : null;
-            if (acc !== null && acc >= 0 && acc < 2) return; // rechaza 0 y 1
+            // Escala 0-3 (3=mejor). Rechazamos SOLO 0 (sin calibrar / >50°). Antes
+            // rechazábamos también 1, pero una brújula a medio calibrar reporta 1
+            // de forma sostenida en interiores/al arrancar → descartaba TODAS las
+            // muestras y el buffer del dwell nunca se llenaba (no narraba nada).
+            if (acc !== null && acc === 0) return;
             setHeadingAccuracy(acc);
 
             // ── Fusión course-over-ground + magnetómetro ────────────────
@@ -907,16 +949,19 @@ export default function ExploreScreen({ navigation }: any) {
     // guard `okContext`).
     const contextSentRef = useRef(false);
 
-    // Habilita el dwell en cuanto hay conexión + ubicación, sin mandar nada.
+    // Habilita el dwell en cuanto hay CONEXIÓN (no esperamos a locationReady: si
+    // el GPS tarda en dar el primer fix, el dwell no debe quedar bloqueado. Cuando
+    // el usuario apunte, updateContextAndNarrate ya comprueba que haya ubicación y
+    // no narra si aún no la hay). Sin esto, un GPS lento dejaba el dwell muerto.
     useEffect(() => {
-        if (locationReady && wsStatus === 'connected' && !contextSentRef.current) {
+        if (wsStatus === 'connected' && !contextSentRef.current) {
             contextSentRef.current = true;         // habilita el dwell
             lastDwellHeadingRef.current = null;    // la 1a fijación dispara sin exigir cambio de dirección
             lastDwellTimeRef.current = 0;          // sin cooldown la primera vez
             dwellFiredRef.current = false;
             headingBufferRef.current = [];
         }
-    }, [locationReady, wsStatus]);
+    }, [wsStatus]);
 
     // ── Watchdog del estado 'thinking' ────────────────────────────────────
     // Si tras 'agent_response' el audio nunca llega (fallo TTS, chunk perdido,
@@ -1000,6 +1045,7 @@ export default function ExploreScreen({ navigation }: any) {
                         const chunk: string = data.audio_event?.audio_base_64;
                         if (chunk) {
                             wsAudioChunks.current.push(chunk);
+                            lastAgentActivityRef.current = Date.now(); // actividad → watchdog
                             if (wsAudioFlushTimer.current) clearTimeout(wsAudioFlushTimer.current);
                             wsAudioFlushTimer.current = setTimeout(() => flushWsAudio(), 250);
                         }
@@ -1300,7 +1346,7 @@ export default function ExploreScreen({ navigation }: any) {
             {/* ── MAP ── */}
             <Animated.View style={[styles.mapContainer, { height: mapHeightAnim }]}>
                 <MapView ref={mapRef} style={styles.map} initialRegion={initialRegion}
-                    showsUserLocation={false} showsCompass={false}
+                    showsUserLocation={true} showsCompass={false}
                     camera={location ? { center: location, heading: cameraHeading, pitch: 0, zoom: 17, altitude: 500 } : undefined}>
                     {location && (
                         <Marker coordinate={location} anchor={{ x: 0.5, y: 0.5 }} flat rotation={markerRotation}>
