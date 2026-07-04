@@ -315,6 +315,10 @@ export default function ExploreScreen({ navigation }: any) {
     // audio que aún suena cuando ElevenLabs manda el audio en varias ráfagas).
     const audioQueueRef = useRef<string[]>([]);
     const isPlayingRef = useRef<boolean>(false);
+    // Carolina está ocupada (pensando o hablando): el dwell NO debe disparar
+    // una nueva narración mientras habla, o el agente ElevenLabs interrumpe la
+    // respuesta en curso y el audio se corta a media frase.
+    const agentBusyRef = useRef<boolean>(false);
     // Grabación: ref (no state) para evitar carreras onPressIn/onPressOut.
     const isRecordingRef = useRef<boolean>(false);
     // Promesa del arranque de grabación en curso (para await-earla al soltar).
@@ -381,6 +385,12 @@ export default function ExploreScreen({ navigation }: any) {
     useEffect(() => {
         Animated.timing(fadeAnim, { toValue: 1, duration: 400, useNativeDriver: true }).start();
     }, []);
+
+    // ── Sincroniza agentBusyRef con el estado (leído desde el callback de
+    // heading, cuya closure está estancada y no puede leer el state directo).
+    useEffect(() => {
+        agentBusyRef.current = agentState === 'thinking' || agentState === 'speaking';
+    }, [agentState]);
 
     // ── Agent state pulse ─────────────────────────────────────────────────
     useEffect(() => {
@@ -674,7 +684,12 @@ export default function ExploreScreen({ navigation }: any) {
                     || Math.abs(angleDiff(dwellHeading - lastDwellHeadingRef.current)) > DWELL_DELTA;
                 const okWs = wsRef.current?.readyState === WebSocket.OPEN;
                 const okContext = contextSentRef.current; // bienvenida inicial ya enviada
-                if (okSpeed && okCooldown && okNewDir && okWs && okContext) {
+                // No disparar si Carolina está hablando/pensando: mandar otra
+                // narración ahora haría que ElevenLabs interrumpa la actual y el
+                // audio se corte. Se esperará: al terminar, si sigues apuntando a
+                // la nueva dirección, el dwell disparará en el próximo evento.
+                const okNotBusy = !agentBusyRef.current;
+                if (okSpeed && okCooldown && okNewDir && okWs && okContext && okNotBusy) {
                     dwellFiredRef.current = true;
                     lastDwellTimeRef.current = nowMs;
                     lastDwellHeadingRef.current = dwellHeading;
@@ -877,6 +892,21 @@ export default function ExploreScreen({ navigation }: any) {
     // ── Send initial location context (first time: location + WS ready) ──
     const contextSentRef = useRef(false);
 
+    // Espera a que Carolina termine de hablar (útil para no pisar el saludo del
+    // teaser con el mensaje de narración). Espera a que se ponga "busy" y luego
+    // deje de estarlo; si no empieza a hablar en ~2.5s, asume que no hay nada que
+    // esperar. Tope de seguridad `maxMs` por si algo se cuelga.
+    const waitForAgentIdle = useCallback(async (maxMs: number): Promise<void> => {
+        const start = Date.now();
+        let wasBusy = false;
+        while (Date.now() - start < maxMs) {
+            if (agentBusyRef.current) wasBusy = true;
+            if (wasBusy && !agentBusyRef.current) return;        // habló y terminó
+            if (!wasBusy && Date.now() - start > 2500) return;   // no hubo saludo
+            await new Promise(r => setTimeout(r, 150));
+        }
+    }, []);
+
     // Realiza el fetch de contexto inicial + narración. skipTeaser=true en los
     // reintentos (ya se saludó). Devuelve true si narró, false si el fetch falló.
     const fetchInitialContextAndNarrate = useCallback(async (): Promise<boolean> => {
@@ -899,6 +929,9 @@ export default function ExploreScreen({ navigation }: any) {
             const trigger = isEs
                 ? 'Ya sé dónde estoy. Cuéntame qué tengo delante sin volver a saludar, con un dato concreto.'
                 : 'I already know where I am. Tell me what is in front of me without greeting again, with a concrete fact.';
+            // Espera a que Carolina termine el saludo del teaser antes de mandar
+            // el trigger: si no, ElevenLabs interrumpe el saludo a media frase.
+            await waitForAgentIdle(9000);
             await sendContextAndTrigger(prompt, trigger);
             previousNarrationContextRef.current = {
                 direction: ctx.direction,
@@ -924,7 +957,7 @@ export default function ExploreScreen({ navigation }: any) {
             console.warn('[ExploreScreen] Context fetch failed:', e);
             return false;
         }
-    }, [sendContextAndTrigger, getRecentlyNarrated]);
+    }, [sendContextAndTrigger, getRecentlyNarrated, waitForAgentIdle]);
 
     const sendLocationContext = useCallback(async () => {
         if (contextSentRef.current) return;
@@ -946,7 +979,10 @@ export default function ExploreScreen({ navigation }: any) {
                 ? "Acabo de abrir la experiencia. Salúdame en una frase y dime 'dame un momento que veo dónde estás'. Sé breve."
                 : "I just opened the experience. Greet me in one sentence and say 'give me a moment while I check where you are'. Keep it brief.";
             wsRef.current.send(JSON.stringify({ type: 'user_message', text: teaser }));
-            await new Promise(r => setTimeout(r, 1500));
+            // Pequeña espera para que el teaser empiece a procesarse; el fetch de
+            // contexto corre en paralelo y el trigger real espera (waitForAgentIdle)
+            // a que el saludo termine antes de enviarse.
+            await new Promise(r => setTimeout(r, 400));
         }
 
         const ok = await fetchInitialContextAndNarrate();
