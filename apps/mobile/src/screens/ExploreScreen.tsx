@@ -332,9 +332,6 @@ export default function ExploreScreen({ navigation }: any) {
     const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     // Watchdog del estado 'thinking' (rescate si el audio nunca llega).
     const thinkingWatchdogRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-    // Reintentos del contexto inicial si el primer fetch falla.
-    const initialContextRetryRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-    const initialContextRetryCountRef = useRef<number>(0);
     // Último timestamp de speed GPS válido (para caducar isMovingRef al pararse).
     const lastValidSpeedTimeRef = useRef<number>(0);
     // Narration timing
@@ -496,7 +493,6 @@ export default function ExploreScreen({ navigation }: any) {
             if (wsAudioFlushTimer.current) clearTimeout(wsAudioFlushTimer.current);
             if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
             if (thinkingWatchdogRef.current) clearTimeout(thinkingWatchdogRef.current);
-            if (initialContextRetryRef.current) clearTimeout(initialContextRetryRef.current);
         };
     }, []);
 
@@ -782,15 +778,28 @@ export default function ExploreScreen({ navigation }: any) {
         }
     }, [playNextFromQueue]);
 
-    // ── Send context + trigger narration via user_message ─────────────────
-    // contextual_update is SILENT — must follow with user_message to get response
+    // ── Send context + trigger narration via UN SOLO user_message ─────────
+    // Verificado contra el WebSocket real de ElevenLabs: mandar contextual_update
+    // + user_message por separado hace que el agente interrumpa su propia
+    // respuesta (evento 'interruption') y el audio se corte a media frase.
+    // La solución: esperar a que el agente esté libre (incluido su saludo
+    // automático al conectar) y mandar UN SOLO user_message con contexto +
+    // pregunta combinados. Así no hay interrupción y el audio llega completo.
     const sendContextAndTrigger = useCallback(async (prompt: string, trigger: string) => {
         if (wsRef.current?.readyState !== WebSocket.OPEN) return;
-        wsRef.current.send(JSON.stringify({ type: 'contextual_update', text: prompt }));
-        await new Promise(r => setTimeout(r, 300));
-        if (wsRef.current?.readyState === WebSocket.OPEN) {
-            wsRef.current.send(JSON.stringify({ type: 'user_message', text: trigger }));
+        // Esperar a que Carolina termine de hablar (agentBusyRef = true mientras
+        // piensa o habla). Lógica embebida (no depende de orden de definición).
+        const start = Date.now();
+        let wasBusy = false;
+        while (Date.now() - start < 12000) {
+            if (agentBusyRef.current) wasBusy = true;
+            if (wasBusy && !agentBusyRef.current) break;      // habló y terminó
+            if (!wasBusy && Date.now() - start > 2000) break; // no había nada sonando
+            await new Promise(r => setTimeout(r, 150));
         }
+        if (wsRef.current?.readyState !== WebSocket.OPEN) return;
+        const combined = `${prompt}\n\n${trigger}`;
+        wsRef.current.send(JSON.stringify({ type: 'user_message', text: combined }));
     }, []);
 
     // ── Update context + narrate (heading change or position change) ──────
@@ -820,7 +829,8 @@ export default function ExploreScreen({ navigation }: any) {
             const prev = previousNarrationContextRef.current;
             let trigger: string;
             if (!prev) {
-                // No re-saludar (el teaser inicial ya saludó): solo pedir datos.
+                // Primera narración (dwell/botón): el agente ya dio su mensaje de
+                // bienvenida (first_message) → no re-saludar, solo pedir datos.
                 trigger = isEs
                     ? 'Ya sé dónde estoy. Cuéntame qué tengo delante sin volver a saludar.'
                     : 'I already know where I am. Tell me what is in front of me without greeting again.';
@@ -889,128 +899,22 @@ export default function ExploreScreen({ navigation }: any) {
         updateContextAndNarrate(h);
     }, [agentState, updateContextAndNarrate]);
 
-    // ── Send initial location context (first time: location + WS ready) ──
+    // ── Habilitación del dwell (first time: location + WS ready) ──────────
+    // Ya NO narramos al abrir: el agente ElevenLabs dice su mensaje de
+    // bienvenida con instrucciones automáticamente (first_message configurado
+    // en su dashboard). La app solo habla cuando el usuario apunta (dwell) o
+    // pulsa el botón. Este ref, al ponerse true, HABILITA el dwell (lo usa el
+    // guard `okContext`).
     const contextSentRef = useRef(false);
 
-    // Espera a que Carolina termine de hablar (útil para no pisar el saludo del
-    // teaser con el mensaje de narración). Espera a que se ponga "busy" y luego
-    // deje de estarlo; si no empieza a hablar en ~2.5s, asume que no hay nada que
-    // esperar. Tope de seguridad `maxMs` por si algo se cuelga.
-    const waitForAgentIdle = useCallback(async (maxMs: number): Promise<void> => {
-        const start = Date.now();
-        let wasBusy = false;
-        while (Date.now() - start < maxMs) {
-            if (agentBusyRef.current) wasBusy = true;
-            if (wasBusy && !agentBusyRef.current) return;        // habló y terminó
-            if (!wasBusy && Date.now() - start > 2500) return;   // no hubo saludo
-            await new Promise(r => setTimeout(r, 150));
-        }
-    }, []);
-
-    // Realiza el fetch de contexto inicial + narración. skipTeaser=true en los
-    // reintentos (ya se saludó). Devuelve true si narró, false si el fetch falló.
-    const fetchInitialContextAndNarrate = useCallback(async (): Promise<boolean> => {
-        const loc = locationRef.current;
-        if (!loc || wsRef.current?.readyState !== WebSocket.OPEN) return false;
-        const isEs = languageRef.current === 'es';
-        try {
-            const res = await apiClient.post('/exploration/context', {
-                latitude: loc.latitude,
-                longitude: loc.longitude,
-                heading: headingRef.current,
-                language: languageRef.current,
-            });
-            const ctx: LocationContext = res.data;
-            setLocationContext(ctx);
-            locationContextRef.current = ctx;
-            const prompt = buildSystemPrompt(ctx, languageRef.current, getRecentlyNarrated());
-            // El teaser ya saludó → el trigger real NO vuelve a saludar (fix #13),
-            // solo pide la narración con datos.
-            const trigger = isEs
-                ? 'Ya sé dónde estoy. Cuéntame qué tengo delante sin volver a saludar, con un dato concreto.'
-                : 'I already know where I am. Tell me what is in front of me without greeting again, with a concrete fact.';
-            // Espera a que Carolina termine el saludo del teaser antes de mandar
-            // el trigger: si no, ElevenLabs interrumpe el saludo a media frase.
-            await waitForAgentIdle(9000);
-            await sendContextAndTrigger(prompt, trigger);
-            previousNarrationContextRef.current = {
-                direction: ctx.direction,
-                heading: headingRef.current,
-                locLat: loc.latitude,
-                locLon: loc.longitude,
-            };
-            // Marcar todos los POIs del contexto como mencionados (fix #14).
-            const nowTs = Date.now();
-            for (const p of [...ctx.directPois, ...ctx.nearbyPois]) {
-                narratedPoisRef.current.set(p.name, nowTs);
-            }
-            // ── Baseline de fijación tras la bienvenida ────────────────────
-            // La narración inicial ya contó lo que hay en la dirección actual;
-            // sembramos el dwell con esa dirección + ahora, para que la PRIMERA
-            // fijación exija un cambio real (>25°) y respete el cooldown de 8s.
-            lastDwellHeadingRef.current = headingRef.current;
-            lastDwellTimeRef.current = nowTs;
+    // Habilita el dwell en cuanto hay conexión + ubicación, sin mandar nada.
+    useEffect(() => {
+        if (locationReady && wsStatus === 'connected' && !contextSentRef.current) {
+            contextSentRef.current = true;         // habilita el dwell
+            lastDwellHeadingRef.current = null;    // la 1a fijación dispara sin exigir cambio de dirección
+            lastDwellTimeRef.current = 0;          // sin cooldown la primera vez
             dwellFiredRef.current = false;
             headingBufferRef.current = [];
-            return true;
-        } catch (e) {
-            console.warn('[ExploreScreen] Context fetch failed:', e);
-            return false;
-        }
-    }, [sendContextAndTrigger, getRecentlyNarrated, waitForAgentIdle]);
-
-    const sendLocationContext = useCallback(async () => {
-        if (contextSentRef.current) return;
-        const loc = locationRef.current;
-        if (!loc || wsRef.current?.readyState !== WebSocket.OPEN) return;
-        contextSentRef.current = true;
-        lastNarrationTimeRef.current = Date.now();
-        lastNarratedLocationRef.current = loc;
-        lastReportedHeadingRef.current = headingRef.current;
-        const isEs = languageRef.current === 'es';
-
-        // ── Teaser inmediato: saludo breve antes de calcular contexto ──────
-        // El backend /exploration/context puede tardar (reverse-geocoding +
-        // Overpass). Mientras, mandamos un user_message muy corto para que
-        // Carolina salude y diga "dame un momento" — así el usuario no ve
-        // silencio los primeros 1-2 s tras abrir la pantalla.
-        if (wsRef.current?.readyState === WebSocket.OPEN) {
-            const teaser = isEs
-                ? "Acabo de abrir la experiencia. Salúdame en una frase y dime 'dame un momento que veo dónde estás'. Sé breve."
-                : "I just opened the experience. Greet me in one sentence and say 'give me a moment while I check where you are'. Keep it brief.";
-            wsRef.current.send(JSON.stringify({ type: 'user_message', text: teaser }));
-            // Pequeña espera para que el teaser empiece a procesarse; el fetch de
-            // contexto corre en paralelo y el trigger real espera (waitForAgentIdle)
-            // a que el saludo termine antes de enviarse.
-            await new Promise(r => setTimeout(r, 400));
-        }
-
-        const ok = await fetchInitialContextAndNarrate();
-        if (!ok) {
-            // ── Reintento con backoff (fix #10) ──────────────────────────────
-            // El teaser ya saludó pero el contexto falló → Carolina se quedaría
-            // muda (el effect disparador no se re-ejecuta). Reintentamos el
-            // fetch+narración saltándonos el teaser, hasta 3 veces (3s/6s/12s).
-            const scheduleRetry = () => {
-                if (initialContextRetryCountRef.current >= 3) return;
-                const delay = 3000 * Math.pow(2, initialContextRetryCountRef.current); // 3s, 6s, 12s
-                initialContextRetryCountRef.current += 1;
-                if (initialContextRetryRef.current) clearTimeout(initialContextRetryRef.current);
-                initialContextRetryRef.current = setTimeout(async () => {
-                    if (unmountedRef.current) return;
-                    if (wsRef.current?.readyState !== WebSocket.OPEN) return;
-                    const retried = await fetchInitialContextAndNarrate();
-                    if (!retried && !unmountedRef.current) scheduleRetry();
-                }, delay);
-            };
-            scheduleRetry();
-        }
-    }, [fetchInitialContextAndNarrate]);
-
-    // Fire context once location is ready AND WS is connected
-    useEffect(() => {
-        if (locationReady && wsStatus === 'connected') {
-            sendLocationContext();
         }
     }, [locationReady, wsStatus]);
 
@@ -1131,13 +1035,20 @@ export default function ExploreScreen({ navigation }: any) {
                         ws.send(JSON.stringify({ type: 'pong', event_id: data.ping_event?.event_id }));
                         break;
                     case 'interruption':
-                        if (wsAudioFlushTimer.current) clearTimeout(wsAudioFlushTimer.current);
-                        if (thinkingWatchdogRef.current) { clearTimeout(thinkingWatchdogRef.current); thinkingWatchdogRef.current = null; }
-                        wsAudioChunks.current = [];
-                        clearAudioQueue();
-                        isPlayingRef.current = false;
-                        try { player.pause(); } catch (_) {}
-                        setAgentState('idle');
+                        // Solo vaciar la cola y pausar si el usuario está grabando
+                        // de verdad (barge-in real). Cualquier otra interrupción es
+                        // espuria (del propio flujo del agente) y cortaría el audio
+                        // a media frase → la ignoramos por completo.
+                        if (isRecordingRef.current) {
+                            if (wsAudioFlushTimer.current) clearTimeout(wsAudioFlushTimer.current);
+                            if (thinkingWatchdogRef.current) { clearTimeout(thinkingWatchdogRef.current); thinkingWatchdogRef.current = null; }
+                            wsAudioChunks.current = [];
+                            clearAudioQueue();
+                            isPlayingRef.current = false;
+                            try { player.pause(); } catch (_) {}
+                            setAgentState('idle');
+                        }
+                        // si no graba: interrupción espuria del agente, ignorar (no cortar audio)
                         break;
                 }
             } catch (e) {
@@ -1309,10 +1220,9 @@ export default function ExploreScreen({ navigation }: any) {
         if (reconnectTimerRef.current) { clearTimeout(reconnectTimerRef.current); reconnectTimerRef.current = null; }
         reconnectAttemptsRef.current = 0;
         connectionAttempted.current = false;
-        // Reset first-narration guard so Carolina greets again after reconnect.
+        // Reset del guard de habilitación del dwell: al reconectar, el useEffect
+        // (locationReady + connected) lo re-habilita. El agente re-saluda solo.
         contextSentRef.current = false;
-        initialContextRetryCountRef.current = 0;
-        if (initialContextRetryRef.current) { clearTimeout(initialContextRetryRef.current); initialContextRetryRef.current = null; }
         // Cerrar el socket viejo anulando sus handlers primero, para que su
         // onclose tardío no pise el estado del nuevo socket (fix #8).
         const old = wsRef.current;
@@ -1394,9 +1304,15 @@ export default function ExploreScreen({ navigation }: any) {
                     camera={location ? { center: location, heading: cameraHeading, pitch: 0, zoom: 17, altitude: 500 } : undefined}>
                     {location && (
                         <Marker coordinate={location} anchor={{ x: 0.5, y: 0.5 }} flat rotation={markerRotation}>
-                            <View style={styles.userMarker}>
-                                <View style={styles.userMarkerDot} />
+                            {/* La rotación se aplica con transform al contenido del
+                                marker (no solo con el prop `rotation` del Marker, que
+                                en iOS no rota views custom de forma fiable — bug
+                                conocido de react-native-maps). La flecha apunta arriba
+                                por defecto (hacia donde mira el usuario) y rota con el
+                                heading. */}
+                            <View style={[styles.userMarker, { transform: [{ rotate: `${markerRotation}deg` }] }]}>
                                 <View style={styles.userMarkerArrow} />
+                                <View style={styles.userMarkerDot} />
                             </View>
                         </Marker>
                     )}
@@ -1694,9 +1610,12 @@ const styles = StyleSheet.create({
     userMarkerDot: { width: 18, height: 18, borderRadius: 9, backgroundColor: '#007AFF',
         borderWidth: 3, borderColor: '#fff', shadowColor: '#007AFF',
         shadowOffset: { width: 0, height: 0 }, shadowOpacity: 0.6, shadowRadius: 6, elevation: 6 },
+    // Flecha: triángulo apuntando ARRIBA (borderBottom relleno), colocada
+    // ENCIMA del punto → indica la dirección a la que mira el usuario. Rota
+    // junto al punto vía el transform del contenedor userMarker.
     userMarkerArrow: { width: 0, height: 0, borderLeftWidth: 5, borderRightWidth: 5,
         borderBottomWidth: 10, borderLeftColor: 'transparent', borderRightColor: 'transparent',
-        borderBottomColor: '#007AFF', marginTop: -2 },
+        borderBottomColor: '#007AFF', marginBottom: -2 },
     // Panel
     panel: { flex: 1, borderTopLeftRadius: 22, borderTopRightRadius: 22, marginTop: -18,
         shadowColor: '#000', shadowOffset: { width: 0, height: -4 }, shadowOpacity: 0.08,
