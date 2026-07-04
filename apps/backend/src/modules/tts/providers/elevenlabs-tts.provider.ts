@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ITTSProvider } from '../interfaces/tts-provider.interface';
 import { AiConfigService } from '../../../config/ai-config.service';
+import { randomUUID } from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -62,6 +63,9 @@ export class ElevenLabsTTSProvider implements ITTSProvider {
                         use_speaker_boost: true,
                     },
                 }),
+                // Network timeout: without this the fetch can hang indefinitely
+                // if ElevenLabs stalls, blocking the request forever.
+                signal: AbortSignal.timeout(15000),
             }
         );
 
@@ -71,7 +75,9 @@ export class ElevenLabsTTSProvider implements ITTSProvider {
         }
 
         const audioBuffer = await response.arrayBuffer();
-        const filename = `tts_${Date.now()}_${language}.mp3`;
+        // Unguessable filename: prevents enumeration of other users' audio by
+        // sweeping timestamps, and avoids collisions under concurrency.
+        const filename = `tts_${randomUUID()}.mp3`;
         const filepath = path.join(this.audioStoragePath, filename);
         fs.writeFileSync(filepath, Buffer.from(audioBuffer));
 

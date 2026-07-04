@@ -20,6 +20,12 @@ async function bootstrap() {
     logger: ['error', 'warn', 'log', 'debug'],
   });
 
+  // Behind Traefik (reverse proxy): trust the first proxy hop so the
+  // ThrottlerGuard sees the real client IP (X-Forwarded-For) instead of the
+  // proxy's IP. Without this, every client shares the proxy IP and rate limits
+  // apply globally instead of per-client.
+  app.set('trust proxy', 1);
+
   // Security headers
   app.use(helmet());
 

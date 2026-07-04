@@ -1,4 +1,4 @@
-import { IsNumber, IsString, Min, Max } from 'class-validator';
+import { IsNumber, IsString, Min, Max, MaxLength } from 'class-validator';
 import { Type } from 'class-transformer';
 
 export class ContextDto {
@@ -21,5 +21,6 @@ export class ContextDto {
   heading: number;
 
   @IsString()
+  @MaxLength(5)
   language: string;
 }

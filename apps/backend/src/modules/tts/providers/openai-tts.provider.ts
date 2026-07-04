@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import OpenAI from 'openai';
 import { ITTSProvider } from '../interfaces/tts-provider.interface';
 import { AiConfigService } from '../../../config/ai-config.service';
+import { randomUUID } from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -52,9 +53,9 @@ export class OpenAITTSProvider implements ITTSProvider {
                 input: text,
             });
 
-            // Generate unique filename
-            const timestamp = Date.now();
-            const filename = `tts_${timestamp}_${language}.mp3`;
+            // Generate unguessable, collision-free filename (prevents timestamp
+            // enumeration of other users' audio).
+            const filename = `tts_${randomUUID()}.mp3`;
             const filepath = path.join(this.audioStoragePath, filename);
 
             // Convert response to buffer and save

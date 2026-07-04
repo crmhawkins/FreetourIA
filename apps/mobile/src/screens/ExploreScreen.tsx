@@ -125,15 +125,31 @@ function angleDiff(delta: number): number {
     return d;
 }
 
-// ── Cooldown dinámico para re-narrar por movimiento ──────────────────────
-// Si el contexto tiene POIs directos delante → reaccionar rápido (25s).
-// Si hay POIs cercanos (no delante) → ritmo medio (45s).
-// Si no hay POIs → ritmo lento (90s) para evitar saturar.
-function dynamicMovementCooldown(ctx: LocationContext | null): number {
-    if (!ctx) return 90000;
-    if (ctx.directPois?.length > 0) return 25000;
-    if (ctx.nearbyPois?.length > 0) return 45000;
-    return 90000;
+// ── Media circular de ángulos (grados) vía promedio de vectores sin/cos ──
+// Evita el bug del wrap-around 0/360 (p.ej. media de 350° y 10° = 0°, no 180°).
+// Devuelve la dirección media en [0,360) o null si el array está vacío.
+function circularMeanDeg(headings: number[]): number | null {
+    if (headings.length === 0) return null;
+    const toR = Math.PI / 180;
+    let sumSin = 0, sumCos = 0;
+    for (const h of headings) {
+        sumSin += Math.sin(h * toR);
+        sumCos += Math.cos(h * toR);
+    }
+    const mean = Math.atan2(sumSin / headings.length, sumCos / headings.length) / toR;
+    return ((mean % 360) + 360) % 360;
+}
+
+// ── Rango angular máximo de un conjunto de headings respecto a su media ──
+// Devuelve la mayor desviación circular (en grados, [0,180]) de cualquier
+// muestra respecto a la media circular. Un rango pequeño = móvil quieto.
+function angularSpreadDeg(headings: number[], mean: number): number {
+    let max = 0;
+    for (const h of headings) {
+        const d = Math.abs(angleDiff(h - mean));
+        if (d > max) max = d;
+    }
+    return max;
 }
 
 // ── Bearing relativo: prefiere POI ancla sobre cardinal ──────────────────
@@ -295,22 +311,56 @@ export default function ExploreScreen({ navigation }: any) {
     const wsAudioChunks = useRef<string[]>([]);
     const wsAudioFlushTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
     const currentAudioFileRef = useRef<string | null>(null);
+    // Cola de reproducción secuencial de WAVs (evita que un replace() pise
+    // audio que aún suena cuando ElevenLabs manda el audio en varias ráfagas).
+    const audioQueueRef = useRef<string[]>([]);
+    const isPlayingRef = useRef<boolean>(false);
+    // Grabación: ref (no state) para evitar carreras onPressIn/onPressOut.
+    const isRecordingRef = useRef<boolean>(false);
+    // Promesa del arranque de grabación en curso (para await-earla al soltar).
+    const recordingStartPromiseRef = useRef<Promise<void> | null>(null);
+    // Componente desmontado: guarda contra WS/subs creados tras un await.
+    const unmountedRef = useRef<boolean>(false);
+    // Cierre intencional del WS (cleanup/reconnect): no auto-reconectar.
+    const intentionalCloseRef = useRef<boolean>(false);
+    // Auto-reconexión con backoff exponencial.
+    const reconnectAttemptsRef = useRef<number>(0);
+    const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    // Watchdog del estado 'thinking' (rescate si el audio nunca llega).
+    const thinkingWatchdogRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    // Reintentos del contexto inicial si el primer fetch falla.
+    const initialContextRetryRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const initialContextRetryCountRef = useRef<number>(0);
+    // Último timestamp de speed GPS válido (para caducar isMovingRef al pararse).
+    const lastValidSpeedTimeRef = useRef<number>(0);
     // Narration timing
     const lastNarrationTimeRef = useRef<number>(0);
-    const stableHeadingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const pendingHeadingRef = useRef<number>(0);
     const lastNarratedLocationRef = useRef<{ latitude: number; longitude: number } | null>(null);
+    // ── Detección de FIJACIÓN (dwell) "apunta y descubre" ───────────────
+    // Buffer de muestras de heading con timestamp. Si el usuario mantiene el
+    // móvil apuntando ~3s a la misma dirección (rango ≤±15°), disparamos una
+    // narración de lo que hay en ESA dirección.
+    const headingBufferRef = useRef<{ h: number; t: number }[]>([]);
+    const lastDwellHeadingRef = useRef<number | null>(null); // última dirección narrada por fijación
+    const lastDwellTimeRef = useRef<number>(0);              // cooldown entre fijaciones
+    const dwellFiredRef = useRef<boolean>(false);            // si la fijación actual ya disparó
+    // Estado de fijación en curso, para feedback visual. El ref evita el bug de
+    // closure estancada dentro del callback de watchHeadingAsync (que se crea una
+    // sola vez): comparamos/actualizamos contra el ref, y solo llamamos a
+    // setDwellActive cuando el valor cambia de verdad (evita re-renders en cada muestra).
+    const dwellActiveRef = useRef<boolean>(false);
+    const [dwellActive, setDwellActive] = useState(false);
     // Sensores: velocidad GPS (m/s), course-over-ground GPS (grados, -1 si no válido)
     const speedRef = useRef<number>(0);
     const gpsCourseRef = useRef<number | null>(null);
-    // isMoving derivado de speed > 1.5 m/s
+    // isMoving derivado de speed > 1.5 m/s (suprime el dwell si va caminando rápido)
     const isMovingRef = useRef<boolean>(false);
-    // Última vez que se detectó movimiento real (para la regla "parado >20s")
-    const lastMovementTimeRef = useRef<number>(Date.now());
-    // Última posición observada en el watchPositionAsync fino (para detectar micro-movimientos)
+    // Última posición observada en el watchPositionAsync fino (rastro para el mapa)
     const lastSeenLocationRef = useRef<{ latitude: number; longitude: number } | null>(null);
-    // Heading suavizado (exponencial) — separado del heading crudo del sensor
-    const smoothedHeadingRef = useRef<number>(0);
+    // Heading suavizado (exponencial) — separado del heading crudo del sensor.
+    // Sentinel null: la PRIMERA muestra adopta el valor crudo (no suaviza desde 0).
+    const smoothedHeadingRef = useRef<number | null>(null);
     // Memoria de POIs ya narrados (name → timestamp ms). TTL 15 min.
     const narratedPoisRef = useRef<Map<string, number>>(new Map());
     // Contexto de la última narración automática (para calcular trigger variable)
@@ -366,14 +416,14 @@ export default function ExploreScreen({ navigation }: any) {
         if (messages.length > 0) setTimeout(() => messagesEndRef.current?.scrollToEnd({ animated: true }), 100);
     }, [messages]);
 
-    // ── Audio finished — clean up temp file ──────────────────────────────
+    // ── Audio finished — clean up temp file + reproducir siguiente en cola ─
     useEffect(() => {
         if (playerStatus.didJustFinish) {
             if (currentAudioFileRef.current) {
                 FileSystem.deleteAsync(currentAudioFileRef.current, { idempotent: true }).catch(() => {});
                 currentAudioFileRef.current = null;
             }
-            setAgentState(wsRef.current?.readyState === WebSocket.OPEN ? 'listening' : 'idle');
+            playNextFromQueue();
         }
     }, [playerStatus.didJustFinish]);
 
@@ -382,20 +432,26 @@ export default function ExploreScreen({ navigation }: any) {
         if (playerStatus.playing) setAgentState('speaking');
     }, [playerStatus.playing]);
 
-    // ── Seed location from global store (camera prop handles map position)
+    // ── Seed location from global store — SOLO la primera vez ─────────────
+    // El GPS grueso global de App.tsx (Balanced, 30s/50m) sigue vivo dentro de
+    // Explore; si dejáramos que cada update machaque `location`, la posición
+    // fina (8m/4s) saltaría a la gruesa y se dispararían narraciones "he
+    // caminado" estando parado. Sembramos una vez y luego ignoramos el store.
     useEffect(() => {
-        if (userLocation) {
+        if (userLocation && !location) {
             setLocation(userLocation);
+            locationRef.current = userLocation;
             setLocationReady(true);
         }
-    }, [userLocation]);
+    }, [userLocation, location]);
 
-    // Seed heading from global store (before fine tracking starts)
+    // Seed heading from global store — solo si aún no hay heading real (sentinel).
     useEffect(() => {
-        if (userHeading) {
+        if (userHeading && smoothedHeadingRef.current === null) {
             setHeading(userHeading);
             setMapHeading(userHeading);
             mapHeadingRef.current = userHeading;
+            headingRef.current = userHeading;
         }
     }, [userHeading]);
 
@@ -407,40 +463,56 @@ export default function ExploreScreen({ navigation }: any) {
     }, []);
 
     // ── GPS tracking (fine-grained updates for map + heading) ───────────
+    // NOTA (rediseño "apunta y descubre"): se eliminó el setInterval de IDLE que
+    // re-narraba al estar parado. Ahora Carolina SOLO habla cuando el usuario
+    // fija el móvil apuntando ~3s (dwell) o pulsa el botón "¿Qué hay delante?".
     useEffect(() => {
         setAudioModeAsync({ playsInSilentMode: true });
         connectToAgent();
         startFineTracking();
 
-        // Cada 5s, si el usuario lleva >20s parado y la última narración fue
-        // hace >45s y se ha desplazado >15m desde la última narrada, re-narramos.
-        const idleCheckInterval = setInterval(() => {
-            const now = Date.now();
-            if (now - lastMovementTimeRef.current <= 20000) return;
-            if (now - lastNarrationTimeRef.current <= 45000) return;
-            if (wsRef.current?.readyState !== WebSocket.OPEN) return;
-            const loc = locationRef.current;
-            if (!loc) return;
-            const lastNarrated = lastNarratedLocationRef.current;
-            if (!lastNarrated) return;
-            if (haversineM(loc, lastNarrated) <= 15) return;
-            updateContextAndNarrate(headingRef.current);
-        }, 5000);
-
         return () => {
+            unmountedRef.current = true;
+            intentionalCloseRef.current = true;
             locationSub.current?.remove();
             headingSub.current?.remove();
-            wsRef.current?.close();
+            const ws = wsRef.current;
+            if (ws) {
+                ws.onopen = ws.onmessage = ws.onerror = ws.onclose = null;
+                try { ws.close(); } catch (_) {}
+            }
+            wsRef.current = null;
             if (mapHeadingTimerRef.current) clearTimeout(mapHeadingTimerRef.current);
-            if (stableHeadingTimerRef.current) clearTimeout(stableHeadingTimerRef.current);
             if (wsAudioFlushTimer.current) clearTimeout(wsAudioFlushTimer.current);
-            clearInterval(idleCheckInterval);
+            if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
+            if (thinkingWatchdogRef.current) clearTimeout(thinkingWatchdogRef.current);
+            if (initialContextRetryRef.current) clearTimeout(initialContextRetryRef.current);
         };
     }, []);
 
     const startFineTracking = async () => {
         const { status } = await Location.requestForegroundPermissionsAsync();
+        if (unmountedRef.current) return;
         if (status !== 'granted') { setPermissionError(true); return; }
+
+        // ── Seed inicial de heading (fix inicial crudo) ──────────────────────
+        // Sin esto, smoothedHeadingRef arranca en el sentinel null y el primer
+        // evento real "tira" desde 0. Con un fix inicial, la brújula parte del
+        // valor real de inmediato.
+        try {
+            const h = await Location.getHeadingAsync();
+            if (unmountedRef.current) return;
+            const seed = h.trueHeading >= 0 ? h.trueHeading : (h.magHeading >= 0 ? h.magHeading : null);
+            if (seed !== null) {
+                const rounded = Math.round(((seed % 360) + 360) % 360);
+                smoothedHeadingRef.current = rounded;
+                headingRef.current = rounded;
+                setHeading(rounded);
+                setMapHeading(rounded);
+                mapHeadingRef.current = rounded;
+                lastReportedHeadingRef.current = rounded;
+            }
+        } catch (_) { /* sin fix inicial: la primera muestra del watch lo siembra */ }
 
         locationSub.current = await Location.watchPositionAsync(
             { accuracy: Location.Accuracy.High, distanceInterval: 8, timeInterval: 4000 },
@@ -456,6 +528,14 @@ export default function ExploreScreen({ navigation }: any) {
                 if (typeof spd === 'number' && spd >= 0) {
                     speedRef.current = spd;
                     isMovingRef.current = spd > 1.5;
+                    lastValidSpeedTimeRef.current = Date.now();
+                } else {
+                    // speed inválido (-1, común al pararse): si hace >8s que no hay
+                    // un speed válido, damos por hecho que está parado. Evita que
+                    // isMovingRef quede clavado en true y los giros nunca se narren.
+                    if (Date.now() - lastValidSpeedTimeRef.current > 8000) {
+                        isMovingRef.current = false;
+                    }
                 }
                 const crs = loc.coords.heading;
                 if (typeof crs === 'number' && crs >= 0) {
@@ -466,43 +546,30 @@ export default function ExploreScreen({ navigation }: any) {
                     gpsCourseRef.current = null;
                 }
 
-                // Detección de movimiento real para la regla "parado >20s":
-                // considera "se movió" si speed > 0.3 m/s o si recorrió >5m
-                // desde la última posición observada.
-                const prevSeen = lastSeenLocationRef.current;
-                const movedMeters = prevSeen ? haversineM(coords, prevSeen) : 0;
-                if ((typeof spd === 'number' && spd > 0.3) || movedMeters > 5) {
-                    lastMovementTimeRef.current = Date.now();
-                }
+                // Rastro de última posición observada (para micro-movimientos y
+                // el marcador del mapa). Ya NO dispara narración: el GPS solo
+                // actualiza posición; la narración la gobierna el dwell / botón.
                 lastSeenLocationRef.current = coords;
-
-                // Re-narrar por movimiento: umbral 20m + cooldown dinámico
-                // según riqueza del contexto (POIs delante → reaccionar rápido).
-                const now = Date.now();
-                const cooldown = dynamicMovementCooldown(locationContextRef.current);
-                if (
-                    wsRef.current?.readyState === WebSocket.OPEN &&
-                    now - lastNarrationTimeRef.current > cooldown &&
-                    lastNarratedLocationRef.current &&
-                    haversineM(coords, lastNarratedLocationRef.current) > 20
-                ) {
-                    lastNarratedLocationRef.current = coords;
-                    updateContextAndNarrate(headingRef.current);
-                }
             }
         );
 
-        headingSub.current = await Location.watchHeadingAsync((hd) => {
+        // Si nos desmontamos durante el await, quitar la sub de posición recién
+        // creada (el cleanup ya corrió antes de que existiera) y no crear más.
+        if (unmountedRef.current) {
+            try { locationSub.current?.remove(); } catch (_) {}
+            return;
+        }
+
+        const sub = await Location.watchHeadingAsync((hd) => {
             // ── Filtrado por accuracy ────────────────────────────────────
-            // iOS: entero 1 (mejor) → 3 (peor). Android: grados.
-            const acc = hd.accuracy ?? null;
-            if (acc !== null) {
-                if (Platform.OS === 'ios') {
-                    if (acc > 2) return; // descartar evento entero
-                } else {
-                    if (acc > 25) return;
-                }
-            }
+            // La escala de heading.accuracy es 0-3 con 3=mejor (IGUAL en iOS y
+            // Android según la doc de expo-location):
+            //   3 = <20° incertidumbre, 2 = <35°, 1 = <50°, 0 = >50° (none).
+            // Descartamos SOLO calibración mala (0 y 1); aceptamos 2 y 3.
+            // Si accuracy viene null/undefined/negativo NO descartamos: mejor un
+            // heading ruidoso que uno congelado.
+            const acc: number | null = (typeof hd.accuracy === 'number') ? hd.accuracy : null;
+            if (acc !== null && acc >= 0 && acc < 2) return; // rechaza 0 y 1
             setHeadingAccuracy(acc);
 
             // ── Fusión course-over-ground + magnetómetro ────────────────
@@ -524,10 +591,17 @@ export default function ExploreScreen({ navigation }: any) {
             }
 
             // ── Suavizado exponencial con wrap-around (diff en [-180,180])
+            // Primera muestra (sentinel null): adopta el valor crudo directamente
+            // en vez de suavizar desde 0 (que "tiraría" el heading hacia el norte
+            // durante varios segundos).
             const prev = smoothedHeadingRef.current;
-            const smoothed = prev + 0.15 * angleDiff(rawHeading - prev);
-            // Normalizar a [0, 360)
-            const normalized = ((smoothed % 360) + 360) % 360;
+            let normalized: number;
+            if (prev === null) {
+                normalized = ((rawHeading % 360) + 360) % 360;
+            } else {
+                const smoothed = prev + 0.15 * angleDiff(rawHeading - prev);
+                normalized = ((smoothed % 360) + 360) % 360;
+            }
             smoothedHeadingRef.current = normalized;
 
             const rounded = Math.round(normalized);
@@ -552,26 +626,71 @@ export default function ExploreScreen({ navigation }: any) {
                 }, 1500);
             }
 
-            // ── Re-narración por giro ───────────────────────────────────
-            // Solo tiene sentido si el usuario está PARADO: cuando camina,
-            // el course GPS ya refleja su dirección real y la narración se
-            // dispara por movimiento, no por giro del teléfono.
-            if (stableHeadingTimerRef.current) clearTimeout(stableHeadingTimerRef.current);
-            if (isMovingRef.current) return;
-            stableHeadingTimerRef.current = setTimeout(() => {
-                const now = Date.now();
-                if (now - lastNarrationTimeRef.current < 60000) return; // 60s cooldown
-                if (wsRef.current?.readyState !== WebSocket.OPEN) return;
-                if (isMovingRef.current) return; // doble check tras el debounce
-                const last = lastReportedHeadingRef.current;
-                if (last === null) return;
-                const diff = Math.abs(pendingHeadingRef.current - last);
-                const angle = diff > 180 ? 360 - diff : diff;
-                if (angle < 60) return; // solo re-narrar si giró ≥60°
-                lastReportedHeadingRef.current = pendingHeadingRef.current;
-                updateContextAndNarrate(pendingHeadingRef.current);
-            }, 8000);
+            // ── Detección de FIJACIÓN (dwell) "apunta y descubre" ────────
+            // El usuario levanta el móvil, APUNTA a un edificio y lo MANTIENE
+            // fijo ~3s → narramos lo que hay en ESA dirección. Reemplaza al
+            // antiguo trigger de giro. Trabaja con el heading suavizado (rounded)
+            // y usa diferencias/medias circulares (wrap-around 0/360 seguro).
+            const nowMs = Date.now();
+            const buf = headingBufferRef.current;
+            buf.push({ h: rounded, t: nowMs });
+            // Purga muestras con antigüedad > 3500ms (ventana algo mayor que 3s).
+            const DWELL_WINDOW = 3000;   // buffer debe cubrir ≥3s
+            const DWELL_MAXAGE = 3500;   // descartar muestras más viejas que esto
+            const DWELL_SPREAD = 15;     // tolerancia ±15° (rango total ≤30°)
+            const DWELL_RESET = 20;      // salir >±20° de la dirección fijada resetea
+            const DWELL_COOLDOWN = 8000; // 8s entre fijaciones
+            const DWELL_DELTA = 25;      // ≥25° de diferencia vs. última fijación narrada
+            const DWELL_MAX_SPEED = 1.5; // >=1.5 m/s (caminando rápido) no dispara
+            while (buf.length > 0 && nowMs - buf[0].t > DWELL_MAXAGE) buf.shift();
+
+            const headings = buf.map(s => s.h);
+            const dwellMean = circularMeanDeg(headings);
+            const coversWindow = buf.length >= 2 && (nowMs - buf[0].t) >= DWELL_WINDOW;
+            const spread = dwellMean !== null ? angularSpreadDeg(headings, dwellMean) : 999;
+            const stable = coversWindow && dwellMean !== null && spread <= DWELL_SPREAD;
+
+            // Setter idempotente del feedback visual (evita re-renders por muestra
+            // y sortea la closure estancada del state dentro de este callback).
+            const setDwell = (v: boolean) => {
+                if (dwellActiveRef.current !== v) { dwellActiveRef.current = v; setDwellActive(v); }
+            };
+
+            // Feedback visual: "apuntando y estabilizándose" mientras aún no fijó.
+            setDwell(stable && !dwellFiredRef.current);
+
+            // Reset de fijación: si el heading se sale >±20° de la dirección ya
+            // fijada, permitir una NUEVA fijación cuando vuelva a estabilizarse.
+            if (dwellFiredRef.current && lastDwellHeadingRef.current !== null) {
+                const away = Math.abs(angleDiff(rounded - lastDwellHeadingRef.current));
+                if (away > DWELL_RESET) dwellFiredRef.current = false;
+            }
+
+            if (stable && dwellMean !== null && !dwellFiredRef.current) {
+                const dwellHeading = Math.round(dwellMean);
+                const okSpeed = speedRef.current < DWELL_MAX_SPEED; // no apunta si va rápido
+                const okCooldown = nowMs - lastDwellTimeRef.current > DWELL_COOLDOWN;
+                const okNewDir = lastDwellHeadingRef.current === null
+                    || Math.abs(angleDiff(dwellHeading - lastDwellHeadingRef.current)) > DWELL_DELTA;
+                const okWs = wsRef.current?.readyState === WebSocket.OPEN;
+                const okContext = contextSentRef.current; // bienvenida inicial ya enviada
+                if (okSpeed && okCooldown && okNewDir && okWs && okContext) {
+                    dwellFiredRef.current = true;
+                    lastDwellTimeRef.current = nowMs;
+                    lastDwellHeadingRef.current = dwellHeading;
+                    setDwell(false);
+                    updateContextAndNarrate(dwellHeading);
+                }
+            }
         }) as any;
+
+        // Si el componente se desmontó mientras esperábamos el await, quitamos
+        // la suscripción recién creada para no dejar sensores huérfanos.
+        if (unmountedRef.current) {
+            try { sub?.remove(); } catch (_) {}
+            return;
+        }
+        headingSub.current = sub;
     };
 
     // ── Lista de POIs mencionados recientemente (últimos 15 min) ─────────
@@ -588,28 +707,65 @@ export default function ExploreScreen({ navigation }: any) {
         return result;
     }, []);
 
-    // ── Play ElevenLabs WS audio (PCM chunks → WAV → play) ──────────────────
-    // Replaces the backend TTS round-trip — ElevenLabs already streams audio via 'audio' events
+    // ── Cola de audio: reproducir el siguiente WAV pendiente ────────────────
+    // Saca la siguiente uri de la cola y la reproduce. Si la cola está vacía,
+    // vuelve a idle/listening. Se llama al terminar cada WAV (didJustFinish).
+    const playNextFromQueue = useCallback(() => {
+        const next = audioQueueRef.current.shift();
+        if (!next) {
+            isPlayingRef.current = false;
+            setAgentState(wsRef.current?.readyState === WebSocket.OPEN ? 'listening' : 'idle');
+            return;
+        }
+        isPlayingRef.current = true;
+        currentAudioFileRef.current = next;
+        try {
+            player.replace({ uri: next });
+            player.play();
+            setAgentState('speaking');
+        } catch (e) {
+            console.warn('[ExploreScreen] WS audio play error:', e);
+            // Salta al siguiente para no quedarse clavado.
+            FileSystem.deleteAsync(next, { idempotent: true }).catch(() => {});
+            currentAudioFileRef.current = null;
+            playNextFromQueue();
+        }
+    }, [player]);
+
+    // ── Vaciar la cola de audio y borrar los ficheros pendientes ────────────
+    // Se llama al empezar a grabar y al recibir 'interruption'.
+    const clearAudioQueue = useCallback(() => {
+        for (const uri of audioQueueRef.current) {
+            FileSystem.deleteAsync(uri, { idempotent: true }).catch(() => {});
+        }
+        audioQueueRef.current = [];
+    }, []);
+
+    // ── Play ElevenLabs WS audio (PCM chunks → WAV → encolar) ───────────────
+    // Reemplaza el round-trip de TTS del backend — ElevenLabs ya envía el audio
+    // por eventos 'audio'. Cada flush AÑADE a la cola (no reemplaza): si un WAV
+    // ya está sonando, este se reproducirá al terminar aquél (didJustFinish),
+    // así no se pierde el resto de la narración cuando llega en varias ráfagas.
     const flushWsAudio = useCallback(async () => {
         const chunks = wsAudioChunks.current;
         if (chunks.length === 0) return;
         wsAudioChunks.current = [];
+        // Si el usuario está grabando, descartamos (no reproducir encima).
+        if (isRecordingRef.current) return;
         try {
             const wavB64 = createWavFromPcmChunks(chunks);
-            const wavUri = `${FileSystem.cacheDirectory}ws_agent_${Date.now()}.wav`;
+            const wavUri = `${FileSystem.cacheDirectory}ws_agent_${Date.now()}_${Math.random().toString(36).slice(2)}.wav`;
             await FileSystem.writeAsStringAsync(wavUri, wavB64, { encoding: 'base64' });
-            if (currentAudioFileRef.current) {
-                FileSystem.deleteAsync(currentAudioFileRef.current, { idempotent: true }).catch(() => {});
-            }
-            currentAudioFileRef.current = wavUri;
-            player.replace({ uri: wavUri });
-            player.play();
-            setAgentState('speaking');
+            // Watchdog de 'thinking': el audio llegó, cancelarlo.
+            if (thinkingWatchdogRef.current) { clearTimeout(thinkingWatchdogRef.current); thinkingWatchdogRef.current = null; }
+            audioQueueRef.current.push(wavUri);
+            // Si no hay nada sonando, arrancar la reproducción de la cola.
+            if (!isPlayingRef.current) playNextFromQueue();
         } catch (e) {
             console.warn('[ExploreScreen] WS audio flush error:', e);
-            setAgentState('idle');
+            if (!isPlayingRef.current) setAgentState('idle');
         }
-    }, [player]);
+    }, [playNextFromQueue]);
 
     // ── Send context + trigger narration via user_message ─────────────────
     // contextual_update is SILENT — must follow with user_message to get response
@@ -626,6 +782,10 @@ export default function ExploreScreen({ navigation }: any) {
     const updateContextAndNarrate = useCallback(async (currentHeading: number) => {
         const loc = locationRef.current;
         if (!loc || wsRef.current?.readyState !== WebSocket.OPEN) return;
+        // Guardamos los valores previos para revertir si el fetch falla y no
+        // consumir el cooldown sin haber narrado (fix #17).
+        const prevNarrationTime = lastNarrationTimeRef.current;
+        const prevNarratedLoc = lastNarratedLocationRef.current;
         lastNarrationTimeRef.current = Date.now();
         lastNarratedLocationRef.current = loc;
         try {
@@ -645,9 +805,10 @@ export default function ExploreScreen({ navigation }: any) {
             const prev = previousNarrationContextRef.current;
             let trigger: string;
             if (!prev) {
+                // No re-saludar (el teaser inicial ya saludó): solo pedir datos.
                 trigger = isEs
-                    ? 'Preséntate brevemente y dime dónde estoy y qué tengo delante.'
-                    : 'Briefly introduce yourself and tell me where I am and what is in front of me.';
+                    ? 'Ya sé dónde estoy. Cuéntame qué tengo delante sin volver a saludar.'
+                    : 'I already know where I am. Tell me what is in front of me without greeting again.';
             } else {
                 const headingDelta = Math.abs(angleDiff(currentHeading - prev.heading));
                 const distMoved = haversineM(
@@ -676,13 +837,94 @@ export default function ExploreScreen({ navigation }: any) {
                 locLat: loc.latitude,
                 locLon: loc.longitude,
             };
+            // ── Memoria de POIs: marcar TODOS los del contexto como mencionados
+            // (no solo los que aparezcan literalmente en el texto). Los nombres
+            // OSM oficiales rara vez coinciden con cómo los nombra Carolina, así
+            // que el matching por texto fallaba y los recontaba. TTL 15 min.
+            const nowTs = Date.now();
+            for (const p of [...ctx.directPois, ...ctx.nearbyPois]) {
+                narratedPoisRef.current.set(p.name, nowTs);
+            }
+            // Baseline de giro actualizado tras narrar (fix #15a): evita que un
+            // giro ya reportado dispare "acabo de girar" al pararse después.
+            lastReportedHeadingRef.current = currentHeading;
         } catch (e) {
             console.warn('[ExploreScreen] Context update error:', e);
+            // Revertir el cooldown para no quedar mudo, dejando un suelo
+            // anti-spam de unos segundos desde ahora (fix #17).
+            lastNarrationTimeRef.current = Math.min(prevNarrationTime, Date.now() - 55000);
+            lastNarratedLocationRef.current = prevNarratedLoc;
         }
     }, [sendContextAndTrigger, getRecentlyNarrated]);
 
+    // ── Botón manual "¿Qué hay delante?" ──────────────────────────────────
+    // Narración inmediata bajo demanda: IGNORA el cooldown y el dwell. También
+    // reajusta la baseline de fijación (dirección + timestamp) para que la
+    // fijación no se re-dispare justo después de pulsar el botón.
+    const askWhatsAhead = useCallback(() => {
+        if (wsRef.current?.readyState !== WebSocket.OPEN) return;
+        if (agentState === 'speaking') return;
+        const h = headingRef.current;
+        lastDwellTimeRef.current = Date.now();
+        lastDwellHeadingRef.current = h;
+        dwellFiredRef.current = true; // evita que el dwell dispare inmediatamente
+        headingBufferRef.current = [];
+        dwellActiveRef.current = false;
+        setDwellActive(false);
+        updateContextAndNarrate(h);
+    }, [agentState, updateContextAndNarrate]);
+
     // ── Send initial location context (first time: location + WS ready) ──
     const contextSentRef = useRef(false);
+
+    // Realiza el fetch de contexto inicial + narración. skipTeaser=true en los
+    // reintentos (ya se saludó). Devuelve true si narró, false si el fetch falló.
+    const fetchInitialContextAndNarrate = useCallback(async (): Promise<boolean> => {
+        const loc = locationRef.current;
+        if (!loc || wsRef.current?.readyState !== WebSocket.OPEN) return false;
+        const isEs = languageRef.current === 'es';
+        try {
+            const res = await apiClient.post('/exploration/context', {
+                latitude: loc.latitude,
+                longitude: loc.longitude,
+                heading: headingRef.current,
+                language: languageRef.current,
+            });
+            const ctx: LocationContext = res.data;
+            setLocationContext(ctx);
+            locationContextRef.current = ctx;
+            const prompt = buildSystemPrompt(ctx, languageRef.current, getRecentlyNarrated());
+            // El teaser ya saludó → el trigger real NO vuelve a saludar (fix #13),
+            // solo pide la narración con datos.
+            const trigger = isEs
+                ? 'Ya sé dónde estoy. Cuéntame qué tengo delante sin volver a saludar, con un dato concreto.'
+                : 'I already know where I am. Tell me what is in front of me without greeting again, with a concrete fact.';
+            await sendContextAndTrigger(prompt, trigger);
+            previousNarrationContextRef.current = {
+                direction: ctx.direction,
+                heading: headingRef.current,
+                locLat: loc.latitude,
+                locLon: loc.longitude,
+            };
+            // Marcar todos los POIs del contexto como mencionados (fix #14).
+            const nowTs = Date.now();
+            for (const p of [...ctx.directPois, ...ctx.nearbyPois]) {
+                narratedPoisRef.current.set(p.name, nowTs);
+            }
+            // ── Baseline de fijación tras la bienvenida ────────────────────
+            // La narración inicial ya contó lo que hay en la dirección actual;
+            // sembramos el dwell con esa dirección + ahora, para que la PRIMERA
+            // fijación exija un cambio real (>25°) y respete el cooldown de 8s.
+            lastDwellHeadingRef.current = headingRef.current;
+            lastDwellTimeRef.current = nowTs;
+            dwellFiredRef.current = false;
+            headingBufferRef.current = [];
+            return true;
+        } catch (e) {
+            console.warn('[ExploreScreen] Context fetch failed:', e);
+            return false;
+        }
+    }, [sendContextAndTrigger, getRecentlyNarrated]);
 
     const sendLocationContext = useCallback(async () => {
         if (contextSentRef.current) return;
@@ -707,32 +949,27 @@ export default function ExploreScreen({ navigation }: any) {
             await new Promise(r => setTimeout(r, 1500));
         }
 
-        try {
-            const res = await apiClient.post('/exploration/context', {
-                latitude: loc.latitude,
-                longitude: loc.longitude,
-                heading: headingRef.current,
-                language: languageRef.current,
-            });
-            const ctx: LocationContext = res.data;
-            setLocationContext(ctx);
-            locationContextRef.current = ctx;
-            const prompt = buildSystemPrompt(ctx, languageRef.current, getRecentlyNarrated());
-            const trigger = isEs
-                ? 'Preséntate brevemente y dime dónde estoy y qué tengo delante.'
-                : 'Briefly introduce yourself and tell me where I am and what is in front of me.';
-            await sendContextAndTrigger(prompt, trigger);
-            previousNarrationContextRef.current = {
-                direction: ctx.direction,
-                heading: headingRef.current,
-                locLat: loc.latitude,
-                locLon: loc.longitude,
+        const ok = await fetchInitialContextAndNarrate();
+        if (!ok) {
+            // ── Reintento con backoff (fix #10) ──────────────────────────────
+            // El teaser ya saludó pero el contexto falló → Carolina se quedaría
+            // muda (el effect disparador no se re-ejecuta). Reintentamos el
+            // fetch+narración saltándonos el teaser, hasta 3 veces (3s/6s/12s).
+            const scheduleRetry = () => {
+                if (initialContextRetryCountRef.current >= 3) return;
+                const delay = 3000 * Math.pow(2, initialContextRetryCountRef.current); // 3s, 6s, 12s
+                initialContextRetryCountRef.current += 1;
+                if (initialContextRetryRef.current) clearTimeout(initialContextRetryRef.current);
+                initialContextRetryRef.current = setTimeout(async () => {
+                    if (unmountedRef.current) return;
+                    if (wsRef.current?.readyState !== WebSocket.OPEN) return;
+                    const retried = await fetchInitialContextAndNarrate();
+                    if (!retried && !unmountedRef.current) scheduleRetry();
+                }, delay);
             };
-        } catch (e) {
-            console.warn('[ExploreScreen] Context fetch failed:', e);
-            contextSentRef.current = false;
+            scheduleRetry();
         }
-    }, [sendContextAndTrigger, getRecentlyNarrated]);
+    }, [fetchInitialContextAndNarrate]);
 
     // Fire context once location is ready AND WS is connected
     useEffect(() => {
@@ -741,10 +978,45 @@ export default function ExploreScreen({ navigation }: any) {
         }
     }, [locationReady, wsStatus]);
 
+    // ── Watchdog del estado 'thinking' ────────────────────────────────────
+    // Si tras 'agent_response' el audio nunca llega (fallo TTS, chunk perdido,
+    // modo texto), el estado quedaría clavado en 'thinking'. Este timeout lo
+    // rescata a listening/idle. Se cancela al empezar a reproducir audio o al
+    // recibir interrupción.
+    const startThinkingWatchdog = useCallback(() => {
+        if (thinkingWatchdogRef.current) clearTimeout(thinkingWatchdogRef.current);
+        thinkingWatchdogRef.current = setTimeout(() => {
+            thinkingWatchdogRef.current = null;
+            // Solo rescatar si seguimos sin reproducir audio.
+            if (isPlayingRef.current) return;
+            setAgentState(wsRef.current?.readyState === WebSocket.OPEN ? 'listening' : 'idle');
+        }, 15000);
+    }, []);
+
+    // Ref al conector para poder reconectar desde onclose sin ciclo de deps.
+    const connectToAgentRef = useRef<() => void>(() => {});
+
+    // ── Reconexión automática con backoff exponencial (fix #8) ─────────────
+    const scheduleReconnect = useCallback(() => {
+        if (unmountedRef.current) return;
+        if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
+        const attempt = reconnectAttemptsRef.current;
+        const delay = Math.min(15000, 1000 * Math.pow(2, attempt)); // 1s,2s,4s,8s,15s…
+        reconnectAttemptsRef.current = attempt + 1;
+        reconnectTimerRef.current = setTimeout(() => {
+            if (unmountedRef.current) return;
+            if (wsRef.current?.readyState === WebSocket.OPEN) return;
+            // Permitir un nuevo intento de conexión (SIN borrar mensajes).
+            connectionAttempted.current = false;
+            connectToAgentRef.current();
+        }, delay);
+    }, []);
+
     // ── ElevenLabs WebSocket ──────────────────────────────────────────────
     const connectToAgent = useCallback(async () => {
         if (connectionAttempted.current) return;
         connectionAttempted.current = true;
+        intentionalCloseRef.current = false;
         setWsStatus('connecting');
 
         // Get WS URL from backend
@@ -756,27 +1028,40 @@ export default function ExploreScreen({ navigation }: any) {
             console.warn('[ExploreScreen] Could not get signed URL');
         }
 
+        // Si nos desmontamos mientras esperábamos el token, NO crear el socket
+        // (evita un WS zombi que vive indefinidamente con coste ElevenLabs).
+        if (unmountedRef.current) return;
+
         const ws = new WebSocket(wsUrl);
         wsRef.current = ws;
 
         ws.onopen = () => {
+            if (wsRef.current !== ws) return; // callback de un socket viejo
+            // Doble seguro: si nos desmontamos justo tras crear el socket.
+            if (unmountedRef.current) { try { ws.close(); } catch (_) {} return; }
             setWsStatus('connected');
+            reconnectAttemptsRef.current = 0; // reset backoff al conectar OK
             lastReportedHeadingRef.current = headingRef.current;
             // Send bare initiation — no overrides (dashboard blocks them)
             ws.send(JSON.stringify({ type: 'conversation_initiation_client_data' }));
         };
 
         ws.onmessage = (event) => {
+            if (wsRef.current !== ws) return; // ignora callbacks de sockets viejos
             try {
                 const data = JSON.parse(event.data);
                 switch (data.type) {
                     case 'audio': {
-                        // Accumulate PCM chunks from ElevenLabs, flush to WAV after 300ms silence
+                        // Si el usuario está grabando, DESCARTAR los chunks: no
+                        // acumular ni programar flush (si no, Carolina reaparece
+                        // 250ms después encima de la grabación — fix #5).
+                        if (isRecordingRef.current) break;
+                        // Acumular chunks PCM; flush a WAV tras 250ms sin chunk nuevo.
                         const chunk: string = data.audio_event?.audio_base_64;
                         if (chunk) {
                             wsAudioChunks.current.push(chunk);
                             if (wsAudioFlushTimer.current) clearTimeout(wsAudioFlushTimer.current);
-                            wsAudioFlushTimer.current = setTimeout(() => flushWsAudio(), 300);
+                            wsAudioFlushTimer.current = setTimeout(() => flushWsAudio(), 250);
                         }
                         break;
                     }
@@ -786,23 +1071,15 @@ export default function ExploreScreen({ navigation }: any) {
                             setLastAgentText(text);
                             addMessage('agent', text);
                             setAgentState('thinking');
+                            // Watchdog: si el audio no llega, volver a listening/idle.
+                            startThinkingWatchdog();
                             // Cualquier respuesta cuenta como narración reciente:
                             // así una conversación en curso no se atropella con
                             // otra narración automática por movimiento o giro.
                             lastNarrationTimeRef.current = Date.now();
-                            // Registrar POIs mencionados en el texto para futura
-                            // memoria "ya mencionado" en buildSystemPrompt.
-                            const ctx = locationContextRef.current;
-                            if (ctx) {
-                                const allPois = [...ctx.directPois, ...ctx.nearbyPois];
-                                const textLower = text.toLowerCase();
-                                for (const p of allPois) {
-                                    if (textLower.includes(p.name.toLowerCase())) {
-                                        narratedPoisRef.current.set(p.name, Date.now());
-                                    }
-                                }
-                            }
                             // Audio arrives via 'audio' events above — no backend TTS call
+                            // (los POIs mencionados se marcan al construir el contexto,
+                            //  no por matching de texto — fix #14).
                         }
                         break;
                     }
@@ -819,7 +1096,10 @@ export default function ExploreScreen({ navigation }: any) {
                         break;
                     case 'interruption':
                         if (wsAudioFlushTimer.current) clearTimeout(wsAudioFlushTimer.current);
+                        if (thinkingWatchdogRef.current) { clearTimeout(thinkingWatchdogRef.current); thinkingWatchdogRef.current = null; }
                         wsAudioChunks.current = [];
+                        clearAudioQueue();
+                        isPlayingRef.current = false;
                         try { player.pause(); } catch (_) {}
                         setAgentState('idle');
                         break;
@@ -829,50 +1109,101 @@ export default function ExploreScreen({ navigation }: any) {
             }
         };
 
-        ws.onerror = (e) => { console.error('[ExploreScreen] WS error:', e); setWsStatus('error'); };
+        ws.onerror = (e) => {
+            if (wsRef.current !== ws) return;
+            console.error('[ExploreScreen] WS error:', e);
+            setWsStatus('error');
+        };
         ws.onclose = (e) => {
+            if (wsRef.current !== ws) return; // onclose tardío de un socket viejo
             console.log('[ExploreScreen] WS closed:', e.code, e.reason);
             setWsStatus('disconnected');
             setAgentState('idle');
+            // Auto-reconexión salvo cierre intencional (cleanup/reconnect) o
+            // desmontaje. Un microcorte de datos ya no mata el tour (fix #8).
+            if (!intentionalCloseRef.current && !unmountedRef.current) {
+                scheduleReconnect();
+            }
         };
-    }, []);
+    }, [flushWsAudio, startThinkingWatchdog, scheduleReconnect, clearAudioQueue]);
+
+    // Mantener el ref del conector actualizado para la auto-reconexión.
+    useEffect(() => { connectToAgentRef.current = connectToAgent; }, [connectToAgent]);
 
     const addMessage = (role: 'user' | 'agent', text: string) => {
         setMessages(prev => [...prev, { id: `${Date.now()}-${Math.random()}`, role, text }]);
     };
 
     // ── Voice recording ───────────────────────────────────────────────────
+    // Nota: el arranque es async (permiso + audioMode + prepare, ~400ms) y el
+    // usuario puede soltar el botón antes de que termine. Usamos isRecordingRef
+    // (no el state, que en la closure del render va desfasado) e guardamos la
+    // promesa de arranque para que stopRecordingAndSend pueda await-earla y así
+    // NUNCA quede la grabadora encendida indefinidamente (fix #3).
     const startRecording = async () => {
-        if (isRecording) return;
-        try {
-            const perm = await AudioModule.requestRecordingPermissionsAsync();
-            if (!perm.granted) {
-                console.warn('[ExploreScreen] Mic permission denied');
-                return;
+        if (isRecordingRef.current) return;
+        // Android graba AAC/.m4a → ElevenLabs no lo transcribe. El botón está
+        // oculto en Android (fix #11), pero por si acaso, no arrancamos.
+        if (Platform.OS !== 'ios') return;
+        isRecordingRef.current = true;
+        setIsRecording(true);
+        setAgentState('listening');
+
+        // Cortar el audio del agente mientras el usuario habla + vaciar la cola.
+        if (wsAudioFlushTimer.current) clearTimeout(wsAudioFlushTimer.current);
+        if (thinkingWatchdogRef.current) { clearTimeout(thinkingWatchdogRef.current); thinkingWatchdogRef.current = null; }
+        wsAudioChunks.current = [];
+        clearAudioQueue();
+        isPlayingRef.current = false;
+        try { player.pause(); } catch (_) {}
+
+        const startPromise = (async () => {
+            try {
+                const perm = await AudioModule.requestRecordingPermissionsAsync();
+                if (!perm.granted) {
+                    console.warn('[ExploreScreen] Mic permission denied');
+                    isRecordingRef.current = false;
+                    setIsRecording(false);
+                    setAgentState('idle');
+                    return;
+                }
+                // Si el usuario ya soltó el botón durante el permiso, abortar.
+                if (!isRecordingRef.current) return;
+                await setAudioModeAsync({ allowsRecording: true, playsInSilentMode: true });
+                if (!isRecordingRef.current) return;
+                await recorder.prepareToRecordAsync();
+                if (!isRecordingRef.current) return;
+                recorder.record();
+            } catch (e) {
+                console.error('[ExploreScreen] Recording start error:', e);
+                isRecordingRef.current = false;
+                setIsRecording(false);
+                setAgentState('idle');
             }
-            await setAudioModeAsync({ allowsRecording: true, playsInSilentMode: true });
-
-            // Stop agent audio while user speaks
-            if (wsAudioFlushTimer.current) clearTimeout(wsAudioFlushTimer.current);
-            wsAudioChunks.current = [];
-            try { player.pause(); } catch (_) {}
-
-            await recorder.prepareToRecordAsync();
-            recorder.record();
-            setIsRecording(true);
-            setAgentState('listening');
-        } catch (e) {
-            console.error('[ExploreScreen] Recording start error:', e);
-        }
+        })();
+        recordingStartPromiseRef.current = startPromise;
+        await startPromise;
     };
 
     const stopRecordingAndSend = async () => {
-        if (!isRecording) return;
+        // Marcamos parada por ref ANTES de nada: si el arranque sigue en curso,
+        // sus checks de isRecordingRef abortarán el record() (fix #3).
+        const wasRecording = isRecordingRef.current;
+        isRecordingRef.current = false;
         setIsRecording(false);
+        if (!wasRecording) return; // no estábamos grabando (ni arrancando)
         setAgentState('thinking');
+
+        // (a) Esperar a que termine el arranque en curso si lo hay.
+        if (recordingStartPromiseRef.current) {
+            try { await recordingStartPromiseRef.current; } catch (_) {}
+            recordingStartPromiseRef.current = null;
+        }
+
         try {
-            await recorder.stop();
-            await setAudioModeAsync({ allowsRecording: false, playsInSilentMode: true });
+            // (b) Parar SIEMPRE la grabadora si quedó activa (aunque el arranque
+            // hubiera llegado tarde). No dependemos del state isRecording.
+            try { await recorder.stop(); } catch (_) {}
 
             const uri = recorder.uri;
             if (!uri || wsRef.current?.readyState !== WebSocket.OPEN) {
@@ -911,11 +1242,18 @@ export default function ExploreScreen({ navigation }: any) {
                 for (let i = 0; i < silenceBytes.length; i++) silenceBin += String.fromCharCode(silenceBytes[i]);
                 wsRef.current.send(JSON.stringify({ user_audio_chunk: btoa(silenceBin) }));
             }
+            // Watchdog: si ElevenLabs no responde con audio, no quedarse en 'thinking'.
+            startThinkingWatchdog();
 
             FileSystem.deleteAsync(uri, { idempotent: true }).catch(() => {});
         } catch (e) {
             console.error('[ExploreScreen] Recording send error:', e);
             setAgentState('idle');
+        } finally {
+            // (c) Resetear SIEMPRE el audio mode (fix #12): si recorder.stop()
+            // lanzó, quedaría en playAndRecord y Carolina sonaría por el
+            // auricular. playsInSilentMode:true para que suene en modo silencio.
+            try { await setAudioModeAsync({ allowsRecording: false, playsInSilentMode: true }); } catch (_) {}
         }
     };
 
@@ -929,17 +1267,32 @@ export default function ExploreScreen({ navigation }: any) {
         setAgentState('thinking');
     };
 
-    // ── Reconnect ─────────────────────────────────────────────────────────
+    // ── Reconnect (manual, botón ↺) ────────────────────────────────────────
     const reconnect = () => {
+        // Cancelar cualquier auto-reconexión pendiente y su backoff.
+        if (reconnectTimerRef.current) { clearTimeout(reconnectTimerRef.current); reconnectTimerRef.current = null; }
+        reconnectAttemptsRef.current = 0;
         connectionAttempted.current = false;
         // Reset first-narration guard so Carolina greets again after reconnect.
         contextSentRef.current = false;
-        wsRef.current?.close();
+        initialContextRetryCountRef.current = 0;
+        if (initialContextRetryRef.current) { clearTimeout(initialContextRetryRef.current); initialContextRetryRef.current = null; }
+        // Cerrar el socket viejo anulando sus handlers primero, para que su
+        // onclose tardío no pise el estado del nuevo socket (fix #8).
+        const old = wsRef.current;
+        if (old) {
+            old.onopen = old.onmessage = old.onerror = old.onclose = null;
+            try { old.close(); } catch (_) {}
+        }
         wsRef.current = null;
         setMessages([]);
         setLastAgentText('');
         setAgentState('idle');
+        if (wsAudioFlushTimer.current) { clearTimeout(wsAudioFlushTimer.current); wsAudioFlushTimer.current = null; }
+        if (thinkingWatchdogRef.current) { clearTimeout(thinkingWatchdogRef.current); thinkingWatchdogRef.current = null; }
         wsAudioChunks.current = [];
+        clearAudioQueue();
+        isPlayingRef.current = false;
         connectToAgent();
     };
 
@@ -955,9 +1308,8 @@ export default function ExploreScreen({ navigation }: any) {
     // ── Derived UI ────────────────────────────────────────────────────────
     const cardinal = headingToCardinal(heading);
     const arrow = headingToArrow(heading);
-    // iOS reporta accuracy como entero 1 (mejor) / 3 (peor); Android en grados.
-    const lowAccuracy = headingAccuracy !== null &&
-        (Platform.OS === 'ios' ? headingAccuracy > 1 : headingAccuracy > 15);
+    // (Se eliminó `lowAccuracy`: no se renderizaba y usaba la escala invertida.
+    //  La escala real de heading.accuracy es 0-3 con 3=mejor; baja sería < 2.)
     const neighborhood = locationContext
         ? locationContext.address.suburb || locationContext.address.city_district || locationContext.address.city || ''
         : '';
@@ -1097,7 +1449,7 @@ export default function ExploreScreen({ navigation }: any) {
                             <Text style={[styles.agentLabel, { color: c.textSecondary }]}>{agentLabel}</Text>
                         </View>
 
-                        {/* Last message / connecting messages */}
+                        {/* Last message / connecting messages / estado de fijación */}
                         <View style={[styles.speechBubble, { backgroundColor: c.surface, borderColor: c.border }]}>
                             {wsStatus === 'connecting' ? (
                                 <>
@@ -1106,6 +1458,10 @@ export default function ExploreScreen({ navigation }: any) {
                                         {connectingMessage}
                                     </Text>
                                 </>
+                            ) : dwellActive && agentState !== 'speaking' && agentState !== 'thinking' ? (
+                                <Text style={[styles.speechText, { color: c.primary, fontWeight: '700', textAlign: 'center' }]}>
+                                    🎯 Apunta y mantén… descubriendo qué tienes delante
+                                </Text>
                             ) : lastAgentText ? (
                                 <Text style={[styles.speechText, { color: c.text }]} numberOfLines={4}>
                                     {lastAgentText}
@@ -1113,7 +1469,7 @@ export default function ExploreScreen({ navigation }: any) {
                             ) : (
                                 <Text style={[styles.speechText, { color: c.textTertiary, textAlign: 'center' }]}>
                                     {wsStatus === 'connected'
-                                        ? 'Mantén pulsado el micrófono para hablar con Carolina…'
+                                        ? 'Apunta a un edificio y mantén el móvil fijo, o pulsa el botón de abajo.'
                                         : wsStatus === 'error' || wsStatus === 'disconnected'
                                         ? 'Pulsa ↺ para reconectar'
                                         : ''}
@@ -1121,22 +1477,53 @@ export default function ExploreScreen({ navigation }: any) {
                             )}
                         </View>
 
-                        {/* Mic button */}
+                        {/* Botón manual "¿Qué hay delante?" — narración inmediata bajo demanda */}
                         <TouchableOpacity
-                            style={[styles.micButton,
-                                isRecording && styles.micButtonActive,
-                                wsStatus !== 'connected' && styles.micButtonDisabled,
+                            style={[styles.aheadButton,
+                                { backgroundColor: c.surface, borderColor: c.primary },
+                                (wsStatus !== 'connected' || agentState === 'speaking') && styles.aheadButtonDisabled,
                             ]}
-                            onPressIn={startRecording}
-                            onPressOut={stopRecordingAndSend}
-                            disabled={wsStatus !== 'connected'}
+                            onPress={askWhatsAhead}
+                            disabled={wsStatus !== 'connected' || agentState === 'speaking'}
                             activeOpacity={0.85}
                         >
-                            <Text style={styles.micIcon}>{isRecording ? '🔴' : '🎤'}</Text>
-                            <Text style={styles.micLabel}>
-                                {isRecording ? 'Suelta para enviar' : 'Mantén para hablar'}
+                            <Text style={[styles.aheadButtonText, { color: c.primary }]}>
+                                🧭 ¿Qué hay delante?
                             </Text>
                         </TouchableOpacity>
+
+                        {/* Mic button — solo iOS. En Android la grabación es AAC
+                            (no PCM) y ElevenLabs no la transcribe → dejaría el
+                            estado en "Procesando" eterno. En Android forzamos el
+                            modo texto para preguntar (fix #11). */}
+                        {Platform.OS === 'ios' ? (
+                            <TouchableOpacity
+                                style={[styles.micButton,
+                                    isRecording && styles.micButtonActive,
+                                    wsStatus !== 'connected' && styles.micButtonDisabled,
+                                ]}
+                                onPressIn={startRecording}
+                                onPressOut={stopRecordingAndSend}
+                                disabled={wsStatus !== 'connected'}
+                                activeOpacity={0.85}
+                            >
+                                <Text style={styles.micIcon}>{isRecording ? '🔴' : '🎤'}</Text>
+                                <Text style={styles.micLabel}>
+                                    {isRecording ? 'Suelta para enviar' : 'Mantén para hablar'}
+                                </Text>
+                            </TouchableOpacity>
+                        ) : (
+                            <TouchableOpacity
+                                style={[styles.micButton, styles.micButtonDisabled]}
+                                onPress={() => switchMode('text')}
+                                activeOpacity={0.85}
+                            >
+                                <Text style={styles.micIcon}>💬</Text>
+                                <Text style={styles.micLabel}>
+                                    {lang === 'es' ? 'Usa el modo texto en Android' : 'Use text mode on Android'}
+                                </Text>
+                            </TouchableOpacity>
+                        )}
                     </View>
 
                 ) : (
@@ -1310,6 +1697,11 @@ const styles = StyleSheet.create({
     micButtonDisabled: { backgroundColor: '#CCC', shadowColor: 'transparent' },
     micIcon: { fontSize: 28 },
     micLabel: { color: '#fff', fontSize: 14, fontWeight: '700' },
+    // Botón manual "¿Qué hay delante?"
+    aheadButton: { borderRadius: 18, borderWidth: 2, paddingVertical: 13,
+        alignItems: 'center', justifyContent: 'center', marginBottom: 14 },
+    aheadButtonDisabled: { opacity: 0.4 },
+    aheadButtonText: { fontSize: 15, fontWeight: '700' },
     // Text panel
     textPanel: { flex: 1, paddingTop: 12 },
     textStatusBar: { flexDirection: 'row', alignItems: 'center', gap: 8,

@@ -1,11 +1,8 @@
 import { Injectable, Logger } from '@nestjs/common';
-import * as fs from 'fs';
-import * as path from 'path';
 import { IdentifyDto } from './dto/identify.dto';
 import { ContextDto } from './dto/context.dto';
 import { SpeakDto } from './dto/speak.dto';
 import { TtsService } from '../tts/tts.service';
-import { AiConfigService } from '../../config/ai-config.service';
 import { GeohashCacheService } from './geohash-cache.service';
 import { geohashEncode } from './geohash.util';
 
@@ -75,7 +72,10 @@ export class ExplorationService {
   private readonly logger = new Logger(ExplorationService.name);
   private readonly OVERPASS_URL = 'https://overpass-api.de/api/interpreter';
   private readonly NOMINATIM_URL = 'https://nominatim.openstreetmap.org/reverse';
-  private readonly HEADING_TOLERANCE_DEG = 50;
+  // Cono "delante" ±35°: modo "apunta y descubre" — el usuario apunta el móvil
+  // a algo concreto, así que el cono es estrecho para narrar lo que apunta, no
+  // toda la zona vagamente en esa dirección.
+  private readonly HEADING_TOLERANCE_DEG = 35;
 
   // Cache tuning
   private readonly NOMINATIM_GEOHASH_PRECISION = 7; // ~150 m
@@ -88,7 +88,6 @@ export class ExplorationService {
 
   constructor(
     private ttsService: TtsService,
-    private aiConfig: AiConfigService,
     private readonly cache: GeohashCacheService,
   ) {}
 
@@ -147,11 +146,11 @@ export class ExplorationService {
         : 'You are exploring an interesting area. Detailed information is not available right now.';
     });
 
-    // 4. Generate audio
+    // 4. Generate audio. The TTS provider writes an unguessable UUID-named
+    // file and returns its /audio/... URL directly (no rename step).
     let finalAudioUrl = '';
     try {
-      const raw = await this.ttsService.generateSpeechAudio(narrationText, language);
-      finalAudioUrl = await this.renameAudioFile(raw);
+      finalAudioUrl = await this.ttsService.generateSpeechAudio(narrationText, language);
     } catch (err) {
       this.logger.error(`TTS error: ${err.message}`);
     }
@@ -169,22 +168,22 @@ export class ExplorationService {
   // ========================================
 
   private buildOverpassQuery(lat: number, lon: number): string {
-    return `[out:json][timeout:15];
+    // Every filter requires ["name"] — Overpass otherwise times out (504) on
+    // dense historic centres because unfiltered way/historic queries are huge.
+    // Restricting to named elements is ~50x faster and matches enrichPois,
+    // which discards unnamed POIs anyway. `nwr` = node + way + relation.
+    return `[out:json][timeout:25];
 (
-  node["tourism"~"attraction|museum|gallery|viewpoint|artwork|monument|information"](around:500,${lat},${lon});
-  node["historic"](around:500,${lat},${lon});
-  node["amenity"~"place_of_worship|theatre|cinema|arts_centre|marketplace|library|university|college|townhall"](around:500,${lat},${lon});
-  node["leisure"~"park|garden|nature_reserve|stadium"](around:500,${lat},${lon});
-  node["place"~"square"](around:500,${lat},${lon});
-  node["man_made"~"tower|lighthouse|windmill|water_tower|obelisk"](around:500,${lat},${lon});
-  node["natural"~"peak|volcano|cliff|beach|spring|cave_entrance"](around:500,${lat},${lon});
-  node["railway"~"station|halt"](around:500,${lat},${lon});
-  node["shop"~"mall|department_store"](around:500,${lat},${lon});
-  way["building"~"cathedral|church|castle|palace|monument|government|civic|stadium|train_station"](around:500,${lat},${lon});
-  way["historic"](around:500,${lat},${lon});
-  way["leisure"~"park|garden"](around:500,${lat},${lon});
+  nwr["name"]["tourism"~"attraction|museum|gallery|viewpoint|artwork|monument|information"](around:500,${lat},${lon});
+  nwr["name"]["historic"](around:500,${lat},${lon});
+  nwr["name"]["amenity"~"place_of_worship|theatre|cinema|arts_centre|marketplace|library|university|college|townhall"](around:500,${lat},${lon});
+  nwr["name"]["leisure"~"park|garden|nature_reserve|stadium"](around:500,${lat},${lon});
+  nwr["name"]["place"~"square"](around:500,${lat},${lon});
+  nwr["name"]["man_made"~"tower|lighthouse|windmill|water_tower|obelisk"](around:500,${lat},${lon});
+  nwr["name"]["natural"~"peak|volcano|cliff|beach|spring|cave_entrance"](around:500,${lat},${lon});
+  nwr["name"]["building"~"cathedral|church|castle|palace|monument"](around:500,${lat},${lon});
 );
-out body center 40;`;
+out tags center 50;`;
   }
 
   private async fetchOverpassPOIs(lat: number, lon: number): Promise<OverpassElement[]> {
@@ -192,9 +191,14 @@ out body center 40;`;
 
     const response = await fetch(this.OVERPASS_URL, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        // Overpass rejects requests with no/blank User-Agent with HTTP 406.
+        'User-Agent': 'FreetourIA/1.0 (tour-guide-app)',
+        Accept: 'application/json',
+      },
       body: `data=${encodeURIComponent(query)}`,
-      signal: AbortSignal.timeout(12000),
+      signal: AbortSignal.timeout(20000),
     });
 
     if (!response.ok) {
@@ -229,12 +233,9 @@ out body center 40;`;
 
     console.log(`[GeohashCache] MISS overpass ${geohash}`);
     try {
-      const elements = await Promise.race([
-        this.fetchOverpassPOIs(lat, lon),
-        new Promise<OverpassElement[]>((_, reject) =>
-          setTimeout(() => reject(new Error('Overpass timeout')), 6000),
-        ),
-      ]);
+      // fetchOverpassPOIs already aborts via AbortSignal.timeout(20000) — no
+      // redundant Promise.race wrapper needed.
+      const elements = await this.fetchOverpassPOIs(lat, lon);
       // Only cache on success.
       this.cache.set(key, elements, this.OVERPASS_TTL_MS);
       return this.filterElementsByRadius(elements, lat, lon, this.POI_RADIUS_M);
@@ -317,12 +318,9 @@ out body center 40;`;
 
     console.log(`[GeohashCache] MISS nominatim ${geohash}`);
     try {
-      const address = await Promise.race([
-        this.fetchNominatimContext(lat, lon, lang),
-        new Promise<NominatimAddress>((_, reject) =>
-          setTimeout(() => reject(new Error('Nominatim timeout')), 4000),
-        ),
-      ]);
+      // fetchNominatimContext already aborts via AbortSignal.timeout(5000) — no
+      // redundant (and previously inconsistent 4s) Promise.race wrapper needed.
+      const address = await this.fetchNominatimContext(lat, lon, lang);
       // Only cache on success.
       this.cache.set(key, address, this.NOMINATIM_TTL_MS);
       return address;
@@ -475,6 +473,12 @@ out body center 40;`;
   ): string {
     const isEs = language === 'es';
 
+    // Sanitise free-text user fields before they touch the LLM prompt: strip
+    // control chars / newlines and truncate, so a crafted value can't inject
+    // fake instructions into the narration prompt.
+    const safeExperienceType = this.sanitizeUserField(experienceType, 40);
+    const safePreviousDirection = this.sanitizeUserField(previousDirection, 40);
+
     // ── Location context ──────────────────────────────────────────
     const neighborhood =
       address.suburb ||
@@ -528,16 +532,16 @@ out body center 40;`;
           : '  No notable points of interest within 500m.';
 
     // ── Optional modifiers ────────────────────────────────────────
-    const expHint = experienceType
+    const expHint = safeExperienceType
       ? isEs
-        ? ` Presta especial atención a los aspectos ${experienceType}.`
-        : ` Pay special attention to ${experienceType} aspects.`
+        ? ` Presta especial atención a los aspectos ${safeExperienceType}.`
+        : ` Pay special attention to ${safeExperienceType} aspects.`
       : '';
 
-    const prevIntro = previousDirection
+    const prevIntro = safePreviousDirection
       ? isEs
-        ? `Empieza diciendo "Antes mirabas hacia el ${previousDirection}." y luego describe lo que ven ahora. `
-        : `Start with "You were just looking towards ${previousDirection}." then describe what they see now. `
+        ? `Empieza diciendo "Antes mirabas hacia el ${safePreviousDirection}." y luego describe lo que ven ahora. `
+        : `Start with "You were just looking towards ${safePreviousDirection}." then describe what they see now. `
       : '';
 
     // ── Final prompt ──────────────────────────────────────────────
@@ -673,9 +677,15 @@ ${prevIntro}NARRATION INSTRUCTIONS:
   // ========================================
 
   async speak(dto: SpeakDto): Promise<{ audioUrl: string }> {
-    const raw = await this.ttsService.generateSpeechAudio(dto.text, dto.language);
-    const audioUrl = await this.renameAudioFile(raw);
-    return { audioUrl };
+    // If TTS (ElevenLabs) fails or times out, degrade gracefully: the mobile
+    // app already handles an empty audioUrl. Never surface a 500 here.
+    try {
+      const audioUrl = await this.ttsService.generateSpeechAudio(dto.text, dto.language);
+      return { audioUrl };
+    } catch (err) {
+      this.logger.warn(`speak() TTS failed, returning empty audioUrl: ${(err as Error).message}`);
+      return { audioUrl: '' };
+    }
   }
 
   // ========================================
@@ -714,26 +724,23 @@ ${prevIntro}NARRATION INSTRUCTIONS:
   }
 
   // ========================================
-  // AUDIO FILE HELPERS
+  // USER-INPUT SANITISATION (prompt-injection defence)
   // ========================================
 
-  private async renameAudioFile(audioUrl: string): Promise<string> {
-    try {
-      const storagePath = this.aiConfig.getAudioStoragePath();
-      const originalFilename = path.basename(audioUrl);
-      const newFilename = `explore_${Date.now()}.mp3`;
-      const originalPath = path.join(storagePath, originalFilename);
-      const newPath = path.join(storagePath, newFilename);
-
-      if (fs.existsSync(originalPath)) {
-        fs.renameSync(originalPath, newPath);
-        return `/audio/${newFilename}`;
-      }
-
-      return audioUrl;
-    } catch (err) {
-      this.logger.warn(`Could not rename audio file: ${err.message}`);
-      return audioUrl;
-    }
+  /**
+   * Sanitises a free-text user field before it is interpolated into an LLM
+   * prompt. Strips newlines and control characters (which could be used to
+   * inject fake instructions) and truncates to `maxLen`.
+   */
+  private sanitizeUserField(s: string | undefined, maxLen = 40): string {
+    if (!s) return '';
+    return s
+      // Strip ASCII control chars (0x00-0x1F incl. \n \r \t) and DEL (0x7F),
+      // which could smuggle fake instructions into the prompt.
+      // eslint-disable-next-line no-control-regex
+      .replace(/[\x00-\x1F\x7F]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, maxLen);
   }
 }

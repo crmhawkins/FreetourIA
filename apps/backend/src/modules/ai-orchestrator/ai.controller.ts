@@ -18,7 +18,6 @@ import {
   IsIn,
 } from 'class-validator';
 import { Type } from 'class-transformer';
-import { SkipThrottle } from '@nestjs/throttler';
 import { AiOrchestratorService } from './ai-orchestrator.service';
 import { TtsService } from '../tts/tts.service';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
@@ -101,7 +100,6 @@ class GenerateAudioDto {
   voice?: string;
 }
 
-@SkipThrottle()
 @UseGuards(JwtAuthGuard)
 @Controller('ai')
 export class AiController {

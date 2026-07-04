@@ -32,8 +32,10 @@ export class AppController {
       environment: process.env.NODE_ENV || 'development',
       services: {
         database: dbStatus,
-        ai: process.env.OPENAI_API_KEY ? 'configured' : 'not configured',
-        tts: process.env.OPENAI_API_KEY ? 'configured' : 'not configured',
+        // Report the providers actually used by the Explore flow: Hawkins AI
+        // for narration and ElevenLabs for TTS (not OpenAI).
+        ai: process.env.HAWKINS_AI_KEY ? 'configured' : 'missing',
+        tts: process.env.ELEVENLABS_API_KEY ? 'configured' : 'missing',
       },
     };
   }
